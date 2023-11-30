@@ -14,7 +14,7 @@ chmod +x my_script.sh
 ```  
 ./AudioFix.sh
 ```
-8. If you don't have **hda-verb** installed, install it first. Open another terminal window and type:
+8. If you don't have **hda-verb** installed, install it first. Open another terminal window and type:   
 Debian/Ubuntu/Raspbian/Kali Linux `apt-get install alsa-tools`   
 Arch Linux `pacman -S alsa-tools`   
 Fedora `dnf install alsa-tools`   
