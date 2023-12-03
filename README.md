@@ -9,7 +9,7 @@ Other distros like Ubuntu/Fedora come pre-installed with **alsa-utils**
 5. **Download** the **AudioFix.sh** file given in this repo.
 6. Open the **Folder** in **Terminal** and type the following commands.
 ```
-chmod +x my_script.sh
+chmod +x AudioFix.sh
 ```
 ```  
 ./AudioFix.sh
