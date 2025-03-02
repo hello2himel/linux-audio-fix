@@ -62,7 +62,7 @@ If the automated method does not resolve your issue, you can follow the manual p
 
    **Here’s a GIF tutorial showing how to disable Auto-Mute:**
 
-   ![Disable Auto-Mute](linux-audio-fix/res/disableAutomute.gif)
+   ![Disable Auto-Mute](res/disableAutomute.gif)
 
 
 5. **Disable Auto-Mute:**
