@@ -63,4 +63,3 @@ echo "✅ hda-verb commands executed!"
 echo "🔄 Rebooting system in 5 seconds..."
 sleep 5
 sudo reboot
-A
