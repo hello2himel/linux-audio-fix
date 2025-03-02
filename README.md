@@ -52,7 +52,7 @@ If the automated method does not resolve your issue, you can follow the manual p
 3. **Launch alsamixer:**
    In your terminal, type `alsamixer` and press enter. If the terminal doesn't detect the command, ensure that `alsa-utils` is installed.
 
-4. 5. **Select the Realtek Sound Card:**
+4. **Select the Realtek Sound Card:**
    - After launching `alsamixer` in your terminal, press `F6` to open the **"Select Sound Card"** menu.
    - You will see a list of available sound cards. The names might be generic, such as **"HD-Audio Generic"** or similar, depending on your system's configuration.
    - Use the **arrow keys** to navigate through the list of sound cards. Once you highlight a card, press **Enter** to select it.
