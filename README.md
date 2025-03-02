@@ -60,7 +60,7 @@ If the automated method does not resolve your issue, you can follow the manual p
 
    If the selected card is not a Realtek chip, you may need to check the system's audio hardware to ensure the correct card is selected.
 
-   **Here’s a tutorial showing how to disable Auto-Mute: (May take a while to load, please wait)**
+   **Here’s a tutorial showing how to disable Auto-Mute: (The video may take a while to load, please wait)**
 
    ![Disable Auto-Mute](res/disableAutomute.gif)
 
