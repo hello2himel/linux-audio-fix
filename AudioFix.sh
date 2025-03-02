@@ -7,10 +7,12 @@ echo "📦 Installing alsa-utils and alsa-tools if missing..."
 if ! command -v alsamixer &> /dev/null; then
     echo "🔹 Installing alsa-utils..."
     sudo pacman -S --noconfirm alsa-utils || sudo apt-get install -y alsa-utils || sudo dnf install -y alsa-utils
+    sleep 3  # Artificial delay
 fi
 if ! command -v hda-verb &> /dev/null; then
     echo "🔹 Installing alsa-tools..."
     sudo pacman -S --noconfirm alsa-tools || sudo apt-get install -y alsa-tools || sudo dnf install -y alsa-tools
+    sleep 3  # Artificial delay
 fi
 
 # Step 2: Detect Realtek Audio Chip
@@ -31,6 +33,7 @@ if [ $found_realtek -eq 0 ]; then
     echo "❌ No Realtek Audio chip detected. Exiting..."
     exit 1
 fi
+sleep 2  # Artificial delay
 
 # Step 3: Get Sound Card Index
 card_num=$(aplay -l | grep "$model" | awk '{print $2}' | sed 's/://')
@@ -40,6 +43,7 @@ if [ -z "$card_num" ]; then
     exit 1
 fi
 echo "🎵 Sound card index: $card_num"
+sleep 2  # Artificial delay
 
 # Step 4: Disable Auto-Mute
 if amixer -c "$card_num" controls | grep -qi "Auto-Mute"; then
@@ -50,6 +54,7 @@ if amixer -c "$card_num" controls | grep -qi "Auto-Mute"; then
 else
     echo "⚠️ No Auto-Mute setting found. Skipping..."
 fi
+sleep 2  # Artificial delay
 
 # Step 5: Run hda-verb commands
 echo "⚡ Running hda-verb commands..."
@@ -58,8 +63,16 @@ sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x4a4b
 sudo hda-verb /dev/snd/hwC0D0 0x20 0x500 0xf
 sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x74
 echo "✅ hda-verb commands executed!"
+sleep 3  # Artificial delay
 
-# Step 6: Reboot
-echo "🔄 Rebooting system in 5 seconds..."
-sleep 5
-sudo reboot
+# Step 6: Reboot Confirmation
+echo "🔄 Do you want to reboot the system now? (Y/n)"
+read -p "Enter your choice: " choice
+choice=${choice:-Y}  # Default to 'Y' if no input is given
+if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
+    echo "Rebooting system in 5 seconds..."
+    sleep 5
+    sudo reboot
+else
+    echo "System reboot aborted. You can reboot later manually."
+fi
