@@ -66,13 +66,23 @@ echo "✅ hda-verb commands executed!"
 sleep 3  # Artificial delay
 
 # Step 6: Reboot Confirmation
-echo "🔄 Do you want to reboot the system now? (Y/n)"
-read -p "Enter your choice: " choice
-choice=${choice:-Y}  # Default to 'Y' if no input is given
-if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
-    echo "Rebooting system in 5 seconds..."
-    sleep 5
-    sudo reboot
-else
-    echo "System reboot aborted. You can reboot later manually."
-fi
+while true; do
+    read -rp "🔄 Do you want to reboot the system now? (Y/n): " choice
+    choice=${choice:-Y}  # Default to 'Y' if no input is given
+    case "$choice" in
+        [Yy]*)
+            echo "♻ Rebooting system in 5 seconds..."
+            sleep 5
+            sudo reboot
+            exit
+            ;;
+        [Nn]*)
+            echo "❌ System reboot aborted. You can reboot later manually."
+            exit
+            ;;
+        *)
+            echo "❗ Invalid input. Please enter 'Y' for Yes or 'N' for No."
+            ;;
+    esac
+done
+
