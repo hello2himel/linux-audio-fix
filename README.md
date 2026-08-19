@@ -6,26 +6,8 @@ This repository provides a script to help you fix issues with Realtek audio driv
 
 The automated method allows you to fix the issue by simply running a script. Follow these steps:
 
-### Step-by-Step:
-
-1. **Clone the repository:**
    ```bash
-   git clone https://github.com/hello2himel/linux-audio-fix.git
-   ```
-
-2. **Navigate to the cloned directory:**
-   ```bash
-   cd linux-audio-fix
-   ```
-
-3. **Give execute permission to the script:**
-   ```bash
-   chmod +x AudioFix.sh
-   ```
-
-4. **Run the script:**
-   ```bash
-   ./AudioFix.sh
+   curl -fsSL https://raw.githubusercontent.com/hello2himel/linux-audio-fix/main/AudioFix.sh | bash
    ```
 
 The script will automatically install the necessary tools, detect the Realtek chip, disable auto-mute, run `hda-verb` commands, and reboot your system.
