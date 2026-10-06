@@ -42,6 +42,7 @@ DO_REBOOT=0
 VERBOSE=0
 QUIET=0
 NO_COLOR_FLAG=0
+PLAIN=0
 FORCE=0
 LIST_CHIPS_ONLY=0
 UNINSTALL=0
@@ -55,6 +56,9 @@ LOG_FILE_OVERRIDE=""
 SUDO_KEEPALIVE_PID=""
 MODEL=""; CARD_NUM=""; CODEC_NUM=""; IFACE=""; SELECTED_INDEX=0
 HDA_DEV_USED=""
+VERBS_OK=0; VERBS_TOTAL=4
+AUTOMUTE_DONE=0; AUTOMUTE_TOTAL=0
+WANT_REBOOT="N"
 
 EXIT_OK=0
 EXIT_ENV=1
@@ -84,8 +88,8 @@ Run modes:
   --no-reboot           Never reboot, never ask
   --apply-verbs-only    Internal: replay hda-verbs only (used by systemd unit)
 
-  Interactive: asks visibly (chip / persistence / test tone / reboot).
-  Non-TTY or --yes: uses defaults, never waits for Enter.
+  Interactive: 3 questions max (chip if ambiguous, persist, reboot).
+  Non-TTY, --yes, or --dry-run: uses defaults, never waits.
 
 Persistence:
   --persist             Install boot persistence (modprobe + systemd verb replay)
@@ -98,6 +102,7 @@ Maintenance:
   -v, --verbose         Verbose command output
   -q, --quiet           Minimal output (warnings/errors only)
   --no-color            Disable colors (also honors NO_COLOR env)
+  --plain, --no-tui     Accepted, ignored (prompts are already plain bash)
   --log-file PATH       Custom log path
   -h, --help            Show this help
   --version             Show version
@@ -139,6 +144,7 @@ parse_args() {
       -v|--verbose) VERBOSE=1; shift ;;
       -q|--quiet) QUIET=1; shift ;;
       --no-color) NO_COLOR_FLAG=1; shift ;;
+      --plain|--no-tui) PLAIN=1; shift ;;
       --force) FORCE=1; shift ;;
       --list-chips|--list) LIST_CHIPS_ONLY=1; shift ;;
       --uninstall) UNINSTALL=1; shift ;;
@@ -251,13 +257,10 @@ rule() {
   log "${C_DIM}${_rule// /-}${C_RESET}"; log_plain "----------------------------------------------------------------------"
 }
 banner() {
-  # Required intro text kept verbatim. EQ art is pure ASCII.
+  # Calm header. Intro lines kept verbatim. No art, no duplicate title.
   SECONDS=0
   STEP_N=0
-  log "${C_DIM}  ||   |||    ||      |||${C_RESET}"
-  log "${C_DIM}  |||  |||    |||     |||  ${C_RESET}${C_BOLD}${C_CYAN}AudioFix${C_RESET}"
-  log "${C_DIM}  |||  ||||||||||---||||||||${C_RESET}"
-  log "${C_BOLD}${C_CYAN}AudioFix${C_RESET}"
+  log "${C_BOLD}AudioFix${C_RESET}"
   log "Fix audio issue in Linux based operating systems."
   log_plain "AudioFix"
   log_plain "Fix audio issue in Linux based operating systems."
@@ -268,14 +271,14 @@ banner() {
 }
 timer_fmt() { local s="${1:-0}"; printf '%02d:%02d' $((s/60)) $((s%60)); }
 step() {
+  # Calm: file always, screen only in --verbose. No rulers/timers by default.
   local title="$1"
-  local el
-  el=$(timer_fmt "$SECONDS")
-  log ""
-  log "${C_BOLD}${C_BLUE}>> ${title} (${el})${C_RESET}"
-  log "${C_BLUE}======================================================================${C_RESET}"
   log_plain ""
-  log_plain ">> ${title} (${el})"
+  log_plain ">> ${title}"
+  if [ "$VERBOSE" -eq 1 ]; then
+    log ""
+    log "${C_BOLD}${C_BLUE}>> ${title}${C_RESET}"
+  fi
 }
 info() { log "${C_CYAN}   ::${C_RESET} $1"; log_plain "   :: $1"; }
 ok()   { log "${C_GREEN}  [OK]${C_RESET} $1"; log_plain "  [OK] $1"; }
@@ -329,6 +332,14 @@ ask() {
   ans="${ans:-$def}"
   printf -v "$__var" '%s' "$ans"
 }
+# --- Plain prompts only (no external TUI deps by design) ---
+# gum/fzf/dialog intentionally not used: keep curl|bash predictable.
+confirm_yn() {
+  # $1 = question, $2 = default Y/N. Returns 0=yes, 1=no. Pure bash.
+  local question="$1" def="$2" ans=""
+  ask "$question" "$def" ans
+  case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
 
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -346,6 +357,27 @@ run() {
     "$@" >>"$LOG_FILE" 2>&1
     return $?
   fi
+}
+run_spin() {
+  # Calm waiting line: one static message, no flickering frames.
+  # Output goes to log; screen shows a single line (verbose streams live).
+  local msg="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "  (dry-run) would run: $*"
+    log_plain "  (dry-run) would run: $*"
+    return 0
+  fi
+  if [ "$VERBOSE" -eq 1 ]; then
+    log "  \$ $*"
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+    return "${PIPESTATUS[0]}"
+  fi
+  if [ "$QUIET" -eq 0 ]; then log "  ... $msg"; fi
+  log_plain "START: $msg ($*)"
+  "$@" >>"$LOG_FILE" 2>&1
+  local code=$?
+  log_plain "END($code): $msg"
+  return "$code"
 }
 
 # ---------------------------------------------------------------------------
@@ -500,7 +532,8 @@ pkg_install() {
         alsa-tools) pkgs="alsa-tools" ;;
         diag) pkgs="pciutils usbutils" ;;
       esac
-      run $SUDO pacman -Sy --needed --noconfirm $pkgs ;;
+      # shellcheck disable=SC2086
+      run_spin "Installing $pkgs (pacman)..." $SUDO pacman -Sy --needed --noconfirm $pkgs ;;
     *debian*|*ubuntu*|*mint*|*pop*|*kali*|*raspbian*|*rasbian*)
       case "$group" in
         alsa-utils) pkgs="alsa-utils alsa-ucm-conf" ;;
@@ -508,21 +541,21 @@ pkg_install() {
         diag) pkgs="pciutils usbutils" ;;
       esac
       if [ "$APT_UPDATED" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-        run $SUDO apt-get update -qq || warn "apt-get update failed, trying install anyway"
+        run_spin "Updating package lists (apt-get update)..." $SUDO apt-get update -qq || warn "apt-get update failed, trying install anyway"
         APT_UPDATED=1
       elif [ "$DRY_RUN" -eq 1 ]; then
         log "  (dry-run) would run: $SUDO apt-get update -qq"
       fi
       # shellcheck disable=SC2086
-      run $SUDO apt-get install -y $pkgs ;;
+      run_spin "Installing $pkgs (apt)..." $SUDO apt-get install -y $pkgs ;;
     *fedora*|*rhel*|*centos*|*rocky*|*alma*|*nobara*)
       case "$group" in
         alsa-utils) pkgs="alsa-utils alsa-ucm" ;;
         alsa-tools) pkgs="alsa-tools" ;;
         diag) pkgs="pciutils usbutils" ;;
       esac
-      if command -v dnf &>/dev/null; then run $SUDO dnf install -y $pkgs
-      else run $SUDO yum install -y $pkgs; fi ;;
+      if command -v dnf &>/dev/null; then run_spin "Installing $pkgs (dnf)..." $SUDO dnf install -y $pkgs
+      else run_spin "Installing $pkgs (yum)..." $SUDO yum install -y $pkgs; fi ;;
     *suse*|*opensuse*|*sles*)
       case "$group" in
         alsa-utils) pkgs="alsa-utils alsa-ucm-conf" ;;
@@ -530,7 +563,7 @@ pkg_install() {
         diag) pkgs="pciutils usbutils" ;;
       esac
       # shellcheck disable=SC2086
-      run $SUDO zypper --non-interactive install $pkgs ;;
+      run_spin "Installing $pkgs (zypper)..." $SUDO zypper --non-interactive install $pkgs ;;
     *gentoo*)
       case "$group" in
         alsa-utils) pkgs="media-sound/alsa-utils" ;;
@@ -538,7 +571,8 @@ pkg_install() {
         diag) pkgs="sys-apps/pciutils sys-apps/usbutils" ;;
       esac
       # shellcheck disable=SC2086
-      run $SUDO emerge --ask=n $pkgs ;;
+      # shellcheck disable=SC2086
+      run_spin "Installing $pkgs (emerge)..." $SUDO emerge --ask=n $pkgs ;;
     *alpine*)
       case "$group" in
         alsa-utils) pkgs="alsa-utils alsa-ucm-conf" ;;
@@ -546,7 +580,7 @@ pkg_install() {
         diag) pkgs="pciutils usbutils" ;;
       esac
       # shellcheck disable=SC2086
-      run $SUDO apk add $pkgs ;;
+      run_spin "Installing $pkgs (apk)..." $SUDO apk add $pkgs ;;
     *void*)
       case "$group" in
         alsa-utils) pkgs="alsa-utils" ;;
@@ -554,7 +588,7 @@ pkg_install() {
         diag) pkgs="pciutils usbutils" ;;
       esac
       # shellcheck disable=SC2086
-      run $SUDO xbps-install -Sy $pkgs ;;
+      run_spin "Installing $pkgs (xbps)..." $SUDO xbps-install -Sy $pkgs ;;
     *nixos*)
       die "NixOS detected: cannot imperatively install. Add to environment.systemPackages: alsa-utils alsa-tools alsa-ucm-conf pciutils usbutils" "$EXIT_PKG" ;;
     *)
@@ -709,11 +743,12 @@ detect_chips() {
   fi
 
   ok "Detected ${#FOUND_MODELS[@]} codec(s) via $FOUND_METHOD"
-  log "  ID  MODEL    IFACE   CARD CODEC  DESCRIPTION"
-  log "  --  -----    -----   ---- -----  -----------"
-  log_plain "ID MODEL IFACE CARD CODEC DESCRIPTION"
   for i in "${!FOUND_MODELS[@]}"; do
-    log "  [$i] $(printf '%-8s %-7s %-4s %-5s  %s' "${FOUND_MODELS[$i]}" "${FOUND_IFACES[$i]}" "${FOUND_CARDS[$i]}" "${FOUND_CODECS[$i]}" "$(chip_desc "${FOUND_MODELS[$i]}")")"
+    log "  [$i] ${FOUND_MODELS[$i]} (card ${FOUND_CARDS[$i]})"
+    log_plain "  [$i] ${FOUND_MODELS[$i]} ${FOUND_IFACES[$i]} card=${FOUND_CARDS[$i]} codec=${FOUND_CODECS[$i]}"
+    if [ "$VERBOSE" -eq 1 ]; then
+      log "      iface=${FOUND_IFACES[$i]} codec=${FOUND_CODECS[$i]}: $(chip_desc "${FOUND_MODELS[$i]}")"
+    fi
   done
   if [ -n "$USB_HINT" ]; then
     warn "hda-verb only applies to HDA (PCI) codecs, NOT to USB audio. USB fix = UCM/PipeWire profile."
@@ -739,29 +774,34 @@ list_chips() {
 }
 
 choose_chip() {
-  # Ask when multiple, but always visible. --card N / --yes skips the question.
+  # Calm wizard Q1 (only when ambiguous). Pure bash, max 2 prompts here.
   SELECTED_INDEX=0
   if [ "${#FOUND_MODELS[@]}" -gt 1 ] && [ -z "$OVERRIDE_CARD" ]; then
-    log "Multiple codecs found:"
+    log "Found ${#FOUND_MODELS[@]} codecs:"
     for i in "${!FOUND_MODELS[@]}"; do
-      log "  [$i] ${FOUND_MODELS[$i]} (${FOUND_IFACES[$i]}) card ${FOUND_CARDS[$i]}"
+      log "  [$i] ${FOUND_MODELS[$i]} (card ${FOUND_CARDS[$i]})"
     done
     if can_prompt; then
-      local sel="" tries=0
-      while [ "$tries" -lt 3 ]; do
-        ask "Enter number [0]:" "0" sel
-        if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -lt "${#FOUND_MODELS[@]}" ]; then
-          SELECTED_INDEX="$sel"; break
-        fi
-        err "Invalid '$sel'. Enter 0-$(( ${#FOUND_MODELS[@]} - 1 ))."
-        tries=$((tries+1))
-      done
-      if ! [[ "$SELECTED_INDEX" =~ ^[0-9]+$ ]] || [ "$SELECTED_INDEX" -ge "${#FOUND_MODELS[@]}" ]; then
-        warn "Bad choice, defaulting to 0"
-        SELECTED_INDEX=0
-      fi
+      local use="" sel=""
+      ask "1/3 Use [0] ${FOUND_MODELS[0]} card ${FOUND_CARDS[0]}? [Y/n]:" "Y" use
+      case "$use" in
+        ""|[Yy]*)
+          SELECTED_INDEX=0
+          log_plain "CHOICE: default 0"
+          ;;
+        *)
+          ask "Enter number [0-$(( ${#FOUND_MODELS[@]} - 1 ))]:" "0" sel
+          if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -lt "${#FOUND_MODELS[@]}" ]; then
+            SELECTED_INDEX="$sel"
+          else
+            warn "Bad choice, using 0"
+            SELECTED_INDEX=0
+          fi
+          log_plain "CHOICE: $SELECTED_INDEX"
+          ;;
+      esac
     else
-      warn "Using [0] ${FOUND_MODELS[0]} (use --card N to pick, or run interactively to choose)."
+      warn "Using [0] ${FOUND_MODELS[0]} (use --card N to pick)."
     fi
   fi
   MODEL="${FOUND_MODELS[$SELECTED_INDEX]}"
@@ -826,26 +866,28 @@ fix_alsa() {
       ctl=$(printf '%s' "$line" | sed -n "s/.*name='\([^']*\)'.*/\1/p")
       [ -z "$ctl" ] && continue
       total=$((total+1))
-      info "Found Auto-Mute control: '$ctl'"
+      if [ "$VERBOSE" -eq 1 ]; then info "Found Auto-Mute control: '$ctl'"; fi
       # idempotency: skip if already Disabled/Off
       if amixer -c "$CARD_NUM" sget "$ctl" 2>/dev/null | grep -qiE 'Disabled|\[off\]'; then
         # sget shows values; Disabled enum appears literally, be conservative:
         if amixer -c "$CARD_NUM" sget "$ctl" 2>/dev/null | grep -q "Disabled"; then
-          ok "'$ctl' already Disabled, skipping"; fixed=$((fixed+1)); continue
+          if [ "$VERBOSE" -eq 1 ]; then ok "'$ctl' already Disabled, skipping"; fi
+          fixed=$((fixed+1)); continue
         fi
       fi
       local done_ctl=0
       for val in Disabled Off; do
         if run amixer -c "$CARD_NUM" sset "$ctl" "$val" >/dev/null 2>&1 || amixer -c "$CARD_NUM" sset "$ctl" "$val" >>"$LOG_FILE" 2>&1; then
-          if [ "$DRY_RUN" -eq 1 ]; then ok "'$ctl' would be set to $val (dry-run)"; fixed=$((fixed+1)); done_ctl=1; break; fi
+          if [ "$DRY_RUN" -eq 1 ]; then fixed=$((fixed+1)); done_ctl=1; break; fi
           if amixer -c "$CARD_NUM" sget "$ctl" 2>/dev/null | grep -q "$val"; then
-            ok "'$ctl' set to $val"; fixed=$((fixed+1)); done_ctl=1; break
+            fixed=$((fixed+1)); done_ctl=1; break
           fi
         fi
       done
       if [ "$done_ctl" -eq 0 ]; then warn "Could not disable '$ctl' (tried Disabled/Off)"; fi
     done <<< "$controls"
-    info "Auto-Mute: $fixed/$total control(s) disabled"
+    AUTOMUTE_DONE=$fixed; AUTOMUTE_TOTAL=$total
+    info "Auto-Mute: $fixed/$total off"
   fi
 
   info "Unmuting essentials (Master/Headphone/Speaker/PCM @80%)..."
@@ -916,12 +958,14 @@ fix_hda_verbs() {
     warn "Exact node hwC${CARD_NUM}D${CODEC_NUM} missing; using $hda_dev (verified fallback)"
   fi
   info "Target device: $hda_dev ($MODEL)"
+  log_plain "Target: $hda_dev ($MODEL)"
+  VERBS_OK=0; VERBS_TOTAL=${#GENERIC_VERBS[@]}
 
   # GET probe: verify HDA communication before SET verbs
   if [ "$DRY_RUN" -eq 0 ]; then
-    if ! $SUDO hda-verb "$hda_dev" 0x20 0xF00 0x00 >>"$LOG_FILE" 2>&1; then
+    if ! run_spin "Probing HDA codec..." $SUDO hda-verb "$hda_dev" 0x20 0xF00 0x00; then
       warn "hda-verb GET probe failed on $hda_dev; SET verbs may also fail"
-    else ok "hda-verb GET probe OK on $hda_dev"; fi
+    elif [ "$VERBOSE" -eq 1 ]; then ok "hda-verb GET probe OK on $hda_dev"; fi
   fi
 
   local ok_count=0 fail_count=0 cmd
@@ -930,12 +974,14 @@ fix_hda_verbs() {
     if run $SUDO hda-verb "$hda_dev" $cmd; then ok_count=$((ok_count+1))
     else warn "hda-verb failed: $cmd"; fail_count=$((fail_count+1)); fi
   done
+  VERBS_OK=$ok_count
   # Persist verb list for the systemd replay unit (under private backup dir, not /tmp)
   if [ "$DRY_RUN" -eq 0 ] && [ -n "${BACKUP_DIR:-}" ] && [ -d "$BACKUP_DIR" ]; then
     printf '%s\n' "${GENERIC_VERBS[@]}" >"$BACKUP_DIR/audiofix-verbs.card${CARD_NUM}.conf" 2>/dev/null || true
     chmod 600 "$BACKUP_DIR"/audiofix-verbs.card*.conf 2>/dev/null || true
   fi
-  if [ "$fail_count" -eq 0 ]; then ok "All $ok_count hda-verb command(s) succeeded on $hda_dev"
+  if [ "$fail_count" -eq 0 ]; then
+    if [ "$VERBOSE" -eq 1 ]; then ok "All $ok_count hda-verb command(s) succeeded on $hda_dev"; fi
   else
     warn "$fail_count verb(s) failed (see $LOG_FILE)"
     if [ "$APPLY_VERBS_ONLY" -eq 1 ]; then return "$EXIT_VERB"; fi
@@ -950,16 +996,8 @@ fix_hda_verbs() {
 persist_fix() {
   step "[6/6] Persistence (survive reboot/suspend)"
   if [ "$PERSIST" = "no" ]; then info "Skipped (--no-persist)"; return 0; fi
-  # Ask visibly; --yes / non-TTY / --dry-run defaults to install (safe).
-  if [ "$PERSIST" = "prompt" ]; then
-    if can_prompt; then
-      local ans=""
-      ask "Install boot persistence (modprobe + systemd)? [Y/n]:" "Y" ans
-      case "$ans" in ""|[Yy]*) PERSIST="yes" ;; *) info "Persistence skipped by user"; return 0 ;; esac
-    else
-      PERSIST="yes"; info "Installing boot persistence (default; --no-persist to skip)"
-    fi
-  fi
+  # Decided upfront in main (wizard Q2). Never asks here.
+  if [ "$PERSIST" = "prompt" ]; then PERSIST="yes"; fi
   if [ "$IFACE" = "USB" ] || [ "$IFACE" = "SOF" ]; then
     warn "Persistence for $IFACE is UCM/SOF based, not modprobe/hda-verb. Skipping unit install."
     info "USB: add VID:PID to /usr/share/alsa/ucm2/USB-Audio/USB-Audio.conf"
@@ -972,21 +1010,23 @@ persist_fix() {
     hint=$(chip_model_hint "$MODEL")
     local first_model
     first_model=$(printf '%s' "$hint" | cut -d, -f1 | LC_ALL=C tr -d ' ')
-    info "Writing $conf (model=$first_model for $MODEL)"
+    info "Persistence: on (survives reboot)"
+    if [ "$VERBOSE" -eq 1 ]; then info "Writing $conf (model=$first_model for $MODEL)"; fi
     local content="# Generated by AudioFix v${VERSION} on $(date -u +%FT%TZ) for $MODEL card $CARD_NUM
 # Alternatives for this chip: model=$hint
 # Docs: https://docs.kernel.org/sound/hd-audio/models.html
 options snd-hda-intel model=${first_model}
 options snd-intel-dspcfg dsp_driver=1
 "
-    if [ "$DRY_RUN" -eq 1 ]; then log "  (dry-run) would write $conf:"; log "$content"
+    if [ "$DRY_RUN" -eq 1 ]; then log "  (dry-run) would write $conf + rebuild initramfs"
     else
-      if echo "$content" | $SUDO tee "$conf" >>"$LOG_FILE" 2>&1; then ok "Wrote $conf"
+      if echo "$content" | $SUDO tee "$conf" >>"$LOG_FILE" 2>&1; then
+        if [ "$VERBOSE" -eq 1 ]; then ok "Wrote $conf"; fi
       else warn "Could not write $conf"; fi
-      # rebuild initramfs (best effort, distro aware)
-      if command -v update-initramfs &>/dev/null; then run $SUDO update-initramfs -u || true
-      elif command -v dracut &>/dev/null; then run $SUDO dracut -f || true
-      elif command -v mkinitcpio &>/dev/null; then run $SUDO mkinitcpio -P || true
+      # rebuild initramfs (best effort, distro aware; can take a minute - spinner)
+      if command -v update-initramfs &>/dev/null; then run_spin "Rebuilding initramfs (update-initramfs, may take a minute)..." $SUDO update-initramfs -u || true
+      elif command -v dracut &>/dev/null; then run_spin "Rebuilding initramfs (dracut, may take a minute)..." $SUDO dracut -f || true
+      elif command -v mkinitcpio &>/dev/null; then run_spin "Rebuilding initramfs (mkinitcpio, may take a minute)..." $SUDO mkinitcpio -P || true
       fi
     fi
   fi
@@ -1048,49 +1088,20 @@ WantedBy=multi-user.target
 # Verify + uninstall + reboot
 # ---------------------------------------------------------------------------
 verify_fix() {
-  echo ""
-  step "Verification"
+  # Calm: details to log (and screen in --verbose), one result line otherwise.
+  log_plain "verify: card=$CARD_NUM model=$MODEL"
   if command -v amixer &>/dev/null; then
     local automute_state
     automute_state=$(amixer -c "$CARD_NUM" sget "Auto-Mute Mode" 2>/dev/null || amixer -c "$CARD_NUM" contents 2>/dev/null | grep -i -A1 "Auto-Mute" | head -5 || true)
-    if printf '%s' "$automute_state" | grep -q "Disabled"; then ok "Auto-Mute reads Disabled"
-    else info "amixer Auto-Mute state: ${automute_state:-unknown} (head -5 shown in log)"; log_plain "$automute_state"; fi
+    log_plain "amixer: $automute_state"
+    if [ "$VERBOSE" -eq 1 ]; then
+      if printf '%s' "$automute_state" | grep -q "Disabled"; then ok "Auto-Mute reads Disabled"
+      else info "amixer Auto-Mute state: ${automute_state:-unknown}"; fi
+    fi
   fi
-  if [ "$QUIET" -eq 0 ] && command -v aplay &>/dev/null; then LC_ALL=C aplay -l 2>/dev/null | head -10 | tee -a "$LOG_FILE" || true; fi
-  info "Kernel audio (last 5 snd/hda lines):"
-  if [ "$QUIET" -eq 0 ]; then
-    dmesg 2>/dev/null | grep -iE 'snd|hda|sof|ALC|CSC3551' | tail -5 | tee -a "$LOG_FILE" || info "(dmesg unavailable in container?)"
-  else
-    dmesg 2>/dev/null | grep -iE 'snd|hda|sof|ALC|CSC3551' | tail -5 >>"$LOG_FILE" 2>/dev/null || true
-  fi
-  if can_prompt; then
-    local t=""
-    ask "Play a 3s test tone now? [y/N]:" "N" t
-    case "$t" in
-      [Yy]*)
-        info "Playing test tone on hw:${CARD_NUM} (1 loop)..."
-        # NOTE: never pipe speaker-test to head - head closes early and
-        # causes SIGPIPE=141, which looked like "[!!] speaker-test failed"
-        # even when sound played fine. Log to file, show tail after.
-        if command -v timeout &>/dev/null; then
-          if timeout 8 speaker-test -c2 -t wav -D "hw:${CARD_NUM}" -l1 >>"$LOG_FILE" 2>&1; then
-            ok "Test tone done (did you hear it?)"
-          else
-            warn "speaker-test exited non-zero (busy/no output? see $LOG_FILE)"
-          fi
-        else
-          if speaker-test -c2 -t wav -D "hw:${CARD_NUM}" -l1 >>"$LOG_FILE" 2>&1; then
-            ok "Test tone done (did you hear it?)"
-          else
-            warn "speaker-test exited non-zero (busy/no output? see $LOG_FILE)"
-          fi
-        fi
-        ;;
-      *) info "Test tone skipped." ;;
-    esac
-  else
-    info "Tip: test sound manually: speaker-test -c2 -t wav -D hw:${CARD_NUM} -l1"
-  fi
+  if command -v aplay &>/dev/null; then LC_ALL=C aplay -l 2>/dev/null | head -10 >>"$LOG_FILE" 2>/dev/null || true; fi
+  dmesg 2>/dev/null | grep -iE 'snd|hda|sof|ALC|CSC3551' | tail -5 >>"$LOG_FILE" 2>/dev/null || true
+  if [ "$VERBOSE" -eq 1 ]; then info "Play any audio to confirm sound works after reboot."; fi
 }
 
 do_uninstall() {
@@ -1129,13 +1140,12 @@ do_uninstall() {
 }
 
 handle_reboot() {
-  rule 68
-  log "  Log    : $LOG_FILE"
-  if [ -n "${BACKUP_DIR:-}" ]; then log "  Backup : $BACKUP_DIR"; fi
+  log "  Log: $LOG_FILE"
+  if [ -n "${BACKUP_DIR:-}" ]; then log "  Backup: $BACKUP_DIR"; fi
   log_plain "Log: $LOG_FILE"
   if [ "$NO_REBOOT" -eq 1 ]; then info "Reboot skipped (--dry-run/--no-reboot). Reboot manually: sudo reboot"; return 0; fi
-  # Visible prompt; --yes / --reboot / non-TTY never blocks.
-  if [ "$DO_REBOOT" -eq 1 ]; then
+  # Decided upfront in main (wizard Q3). Never asks here.
+  if [ "$DO_REBOOT" -eq 1 ] || [ "${WANT_REBOOT:-N}" = "Y" ]; then
     ok "Rebooting in 5s (Ctrl+C to cancel)..."
     sleep 5
     cleanup
@@ -1143,22 +1153,7 @@ handle_reboot() {
     else $SUDO reboot; fi
     return 0
   fi
-  if can_prompt; then
-    local choice=""
-    ask "Reboot now to apply fully? [y/N]:" "N" choice
-    case "$choice" in
-      [Yy]*)
-        ok "Rebooting in 5s (Ctrl+C to cancel)..."
-        sleep 5
-        cleanup
-        if command -v systemctl &>/dev/null; then $SUDO systemctl reboot || $SUDO reboot
-        else $SUDO reboot; fi
-        ;;
-      *) info "Done. Reboot manually when convenient: sudo reboot" ;;
-    esac
-    return 0
-  fi
-  info "Done. Reboot manually to apply fully: sudo reboot (or re-run with --reboot)"
+  info "Done. Reboot manually when convenient: sudo reboot"
   return 0
 }
 
@@ -1205,31 +1200,39 @@ main() {
 
   if [ "$DRY_RUN" -eq 1 ]; then info "DRY-RUN: no changes will be made"; fi
 
+  log "Fix will: unmute, turn off Auto-Mute, run init."
+  log_plain "Plan: unmute + Auto-Mute off + hda-verb init"
+  if can_prompt; then
+    if [ "$PERSIST" = "prompt" ]; then
+      if confirm_yn "2/3 Keep fix after reboot? [Y/n]:" "Y"; then PERSIST="yes"; else PERSIST="no"; fi
+    fi
+    if [ "$DO_REBOOT" -eq 0 ] && [ "$NO_REBOOT" -eq 0 ]; then
+      if confirm_yn "3/3 Reboot when done? [y/N]:" "N"; then WANT_REBOOT="Y"; else WANT_REBOOT="N"; fi
+    elif [ "$DO_REBOOT" -eq 1 ]; then
+      WANT_REBOOT="Y"
+    else
+      WANT_REBOOT="N"
+    fi
+  else
+    if [ "$PERSIST" = "prompt" ]; then PERSIST="yes"; fi
+    if [ "$DO_REBOOT" -eq 1 ]; then WANT_REBOOT="Y"; else WANT_REBOOT="N"; fi
+  fi
+
+  log "Working..."
+  log_plain "Working..."
+
   backup_alsa
   fix_alsa
   fix_hda_verbs || exit "$?"
   if [ "$PERSIST" != "no" ]; then persist_fix; else info "Persistence skipped (--no-persist)"; fi
   verify_fix
 
-  _s1="Chip   : $MODEL (card $CARD_NUM / codec $CODEC_NUM / $IFACE)"
-  _s2="Result : Auto-Mute fixed + verbs replayed (if HDA)"
-  _s3="Log    : $LOG_FILE"
-  _next1="Next   : 1) speaker-test -c2 -t wav -D hw:${CARD_NUM} -l1"
-  _next2="Next   : 2) sudo reboot if still silent"
-  if [ "$IFACE" != "HDA" ]; then
-    _s4="Note   : $MODEL is $IFACE - see USB/SOF guidance above"
-    if [ -n "$SOF_HINT" ]; then
-      summary_box "DONE" "$_s1" "$_s2" "$_s3" "$_s4" "Note   : SOF/amp hint - check sof-firmware + CS35L41 quirk" "$_next1" "$_next2"
-    else
-      summary_box "DONE" "$_s1" "$_s2" "$_s3" "$_s4" "$_next1" "$_next2"
-    fi
-  else
-    if [ -n "$SOF_HINT" ]; then
-      summary_box "DONE" "$_s1" "$_s2" "$_s3" "Note   : SOF/amp hint - check sof-firmware + CS35L41 quirk" "$_next1" "$_next2"
-    else
-      summary_box "DONE" "$_s1" "$_s2" "$_s3" "$_next1" "$_next2"
-    fi
-  fi
+  log "Done: unmuted, Auto-Mute ${AUTOMUTE_DONE}/${AUTOMUTE_TOTAL} off, init ${VERBS_OK}/${VERBS_TOTAL}. Reboot: $([ "$WANT_REBOOT" = "Y" ] && echo yes || echo no)."
+  log_plain "Done: model=$MODEL card=$CARD_NUM verbs=$VERBS_OK/$VERBS_TOTAL reboot=$WANT_REBOOT"
+  if [ "$IFACE" != "HDA" ]; then warn "$MODEL is $IFACE - see USB/SOF guidance above."; fi
+  if [ -n "$SOF_HINT" ]; then warn "SOF/amp hint - check sof-firmware + CS35L41 quirk."; fi
+  log "Log: $LOG_FILE"
+  log_plain "Log: $LOG_FILE"
 
   handle_reboot
 }

@@ -60,5 +60,5 @@ sudo reboot
 
 - USB `ALC4080/82`? `hda-verb` does not apply. Check UCM `USB-Audio.conf` VID:PID + PipeWire profile.
 - SOF / `CSC3551` / smart-amp? Needs `sof-firmware` + amp quirk, not just verbs.
-- Test tone? Answered prompt runs `speaker-test -c2 -D hw:N -l1`, or run manually.
+- Confirm sound? Play any audio after the fix, reboot if still silent.
 - Revert? `--uninstall` removes conf/unit and restores ALSA backup.
