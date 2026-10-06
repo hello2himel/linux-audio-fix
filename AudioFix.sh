@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# AudioFix.sh v2.0.0 - Prod-grade Realtek HDA audio fix
+# AudioFix.sh v2.1.0 - Realtek HDA audio fix
 #
-# Fixes: Auto-Mute muting speakers/headphones + missing EAPD/coef init (hda-verb)
+# Fixes silent/crackling audio: unmutes outputs, turns off Auto-Mute,
+# sends the codec init sequence, optionally makes it survive reboot.
 # Repo: https://github.com/hello2himel/linux-audio-fix
 #
 # Usage:
@@ -10,19 +11,18 @@
 #   ./AudioFix.sh [options]
 #
 # Examples:
+#   ./AudioFix.sh                         # guided fix (recommended)
+#   ./AudioFix.sh --dry-run               # preview, changes nothing
+#   ./AudioFix.sh --yes                   # non-interactive, safe defaults
+#   ./AudioFix.sh --restore               # undo: put back saved settings
 #   ./AudioFix.sh --list-chips            # probe only, change nothing
-#   ./AudioFix.sh --dry-run --verbose     # preview what would happen
-#   ./AudioFix.sh                         # interactive fix (recommended)
-#   ./AudioFix.sh --yes --reboot          # unattended + reboot
-#   ./AudioFix.sh --card 1 --chip ALC256 --force  # override detection
-#   ./AudioFix.sh --uninstall             # remove persistence, restore backup
 #
 set -Eeuo pipefail
 # Secure PATH for root execs (pentest: PATH hijack via update-initramfs etc.)
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # ---------------------------------------------------------------------------
 # Bash / env pre-flight
@@ -46,86 +46,88 @@ PLAIN=0
 FORCE=0
 LIST_CHIPS_ONLY=0
 UNINSTALL=0
+RESTORE=0
+RESTORE_DIR=""
 APPLY_VERBS_ONLY=0
 OVERRIDE_CARD=""
 OVERRIDE_CHIP=""
 PERSIST="prompt"          # prompt|yes|no
 PERSIST_MODE="both"       # modprobe|systemd|both
 BACKUP_DIR=""
+BACKUP_ROOT=""
 LOG_FILE_OVERRIDE=""
 SUDO_KEEPALIVE_PID=""
 MODEL=""; CARD_NUM=""; CODEC_NUM=""; IFACE=""; SELECTED_INDEX=0
 HDA_DEV_USED=""
 VERBS_OK=0; VERBS_TOTAL=4
 AUTOMUTE_DONE=0; AUTOMUTE_TOTAL=0
+UNMUTED_LIST=""
 WANT_REBOOT="N"
+HEARD=""
+SOUND_SERVER=""
+LOCK_DIR="/tmp/audiofix.lock"
+LOCK_CREATED=0
 
 EXIT_OK=0
 EXIT_ENV=1
-EXIT_NO_CHIP=2
+EXIT_USAGE=2
 EXIT_PKG=3
-EXIT_VERB=4
+EXIT_ROOT=4
+EXIT_HW=5
+EXIT_VERIFY=6
+EXIT_ABORT=130
+# Back-compat aliases for old names used in a few places.
+EXIT_NO_CHIP=$EXIT_HW
+JSON=0
+JSON_STATUS="error"
+JSON_DETAIL=""
+JSON_EMITTED=0
 
 # ---------------------------------------------------------------------------
 # Help / version
 # ---------------------------------------------------------------------------
 print_help() {
   cat <<EOF
-AudioFix v${VERSION} - Realtek HDA audio fix (Auto-Mute + hda-verb EAPD init)
+AudioFix v${VERSION} - fix silent or crackling audio on Linux
 
-Usage: $0 [options]
+Usage
+  $0 [options]
 
-Detection:
-  --list-chips          List detected codecs and exit (no changes)
-  --card N              Force use of ALSA card N (skip chooser)
-  --chip MODEL          Force chip model, e.g. --chip ALC256 (use with --force if unknown)
-  --force               Allow running on unknown / non-allowlisted / USB+SOF chips
+Common
+  -y, --yes          Don't ask questions, use recommended answers
+  -n, --dry-run      Show what would change, change nothing
+      --restore      Undo the last fix
 
-Run modes:
-  -n, --dry-run         Preview only, change nothing (implies --no-reboot, no prompts)
-  -y, --yes             Skip questions, use defaults (no reboot unless --reboot)
-  --reboot              Reboot automatically at end (default: ask once, default N)
-  --no-reboot           Never reboot, never ask
-  --apply-verbs-only    Internal: replay hda-verbs only (used by systemd unit)
+More
+  --list-chips       Show audio chips and exit
+  --card N           Use sound card N
+  --chip MODEL       Assume chip MODEL (needs --force if unknown)
+  --force            Allow unknown chips (you confirm first)
+  --reboot           Restart automatically at the end
+  --no-reboot        Never restart
+  --persist          Keep the fix after restart
+  --no-persist       Temporary fix, lost on restart
+  --persist-mode M   modprobe|systemd|both (default: both)
+  --backup-dir DIR   Where to keep backups
+  --uninstall        Remove the permanent fix, restore backup
+  -v, --verbose      Show every command that runs
+  -q, --quiet        Only errors (silent on success)
+      --no-color     Disable colors (also honors NO_COLOR)
+      --json         Machine-readable result on stdout
+  --log-file PATH    Custom log path
+  -h, --help         Show this help
+      --version      Show version
 
-  Interactive: 3 questions max (chip if ambiguous, persist, reboot).
-  Non-TTY, --yes, or --dry-run: uses defaults, never waits.
+Exit codes: 0 fixed | 1 error | 2 bad flags | 3 install failed |
+            4 needs root | 5 unsupported hardware | 6 no sound heard |
+            130 stopped by you
 
-Persistence:
-  --persist             Install boot persistence (modprobe + systemd verb replay)
-  --no-persist          Skip boot persistence
-  --persist-mode MODE   modprobe|systemd|both (default: both)
+Examples
+  $0                    Guided fix
+  $0 --dry-run          Preview only
+  $0 --restore          Put things back
 
-Maintenance:
-  --backup-dir DIR      Where to store backups (default: auto under /var/tmp or /tmp)
-  --uninstall           Remove persistence files + restore ALSA backup if found
-  -v, --verbose         Verbose command output
-  -q, --quiet           Minimal output (warnings/errors only)
-  --no-color            Disable colors (also honors NO_COLOR env)
-  --plain, --no-tui     Accepted, ignored (prompts are already plain bash)
-  --log-file PATH       Custom log path
-  -h, --help            Show this help
-  --version             Show version
-
-Exit codes: 0 ok | 1 env/usage | 2 no chip | 3 package fail | 4 verb fail
-
-Supported chips (HDA, hda-verb safe): ALC221 ALC231 ALC233 ALC234 ALC235 ALC236
-  ALC245 ALC255 ALC256/ALC3246 ALC257 ALC259 ALC260 ALC262 ALC267 ALC268 ALC269
-  ALC270 ALC271X ALC272 ALC273 ALC274/ALC3254 ALC275 ALC276 ALC280 ALC282 ALC283
-  ALC284 ALC285 ALC286 ALC287 ALC288 ALC289 ALC290 ALC292/ALC3220 ALC293 ALC294
-  ALC295/ALC3253 ALC298 ALC299 ALC300 ALC215 ALC225 ALC230 ALC3234 ALC668 ALC670
-  ALC671 ALC672 ALC676 ALC680 ALC662 ALC663 ALC665 ALC891 ALC861 ALC861VD ALC867
-  ALC880 ALC882 ALC883 ALC885 ALC887 ALC888 ALC889 ALC892 ALC898 ALC899 ALC1150
-  ALC1220/ALC1220P/ALC1220-VB/ALCS1220A ALC1250 ALC897 ALC1200 ALC700
-USB (hda-verb does NOT apply, script guides UCM instead): ALC4080 ALC4082
-  ALC4040 ALC4050 ALC4070
-SOF/I2S/SoundWire (hda-verb does NOT apply): RT5682/S RT715 RT714 RT1318/ALC1318
-  RT1320 RT722 ALC3306-as-ALC287 (hybrid, needs amp quirk)
-
-Notes:
-  - hda-verb is volatile: it is lost on reboot/suspend. Use --persist for a
-    systemd replay unit + modprobe model quirk.
-  - USB and SOF devices are detected and explained, not blindly verb-poked.
+Docs and issues: https://github.com/hello2himel/linux-audio-fix
 EOF
 }
 
@@ -144,164 +146,190 @@ parse_args() {
       -v|--verbose) VERBOSE=1; shift ;;
       -q|--quiet) QUIET=1; shift ;;
       --no-color) NO_COLOR_FLAG=1; shift ;;
+      --json) JSON=1; QUIET=1; shift ;;
       --plain|--no-tui) PLAIN=1; shift ;;
       --force) FORCE=1; shift ;;
       --list-chips|--list) LIST_CHIPS_ONLY=1; shift ;;
       --uninstall) UNINSTALL=1; shift ;;
+      --restore) RESTORE=1; shift ;;
+      --restore=*) RESTORE=1; RESTORE_DIR="${1#*=}"; shift ;;
       --apply-verbs-only) APPLY_VERBS_ONLY=1; shift ;;
       --persist) PERSIST="yes"; shift ;;
       --no-persist) PERSIST="no"; shift ;;
       --persist-mode)
-        [ $# -ge 2 ] || { echo "ERROR: --persist-mode needs a value (modprobe|systemd|both)" >&2; exit "$EXIT_ENV"; }
+        [ $# -ge 2 ] || { echo "ERROR: --persist-mode needs a value (modprobe|systemd|both)" >&2; exit "$EXIT_USAGE"; }
         PERSIST_MODE="$2"; shift 2 ;;
       --persist-mode=*)
-        [ -n "${1#*=}" ] || { echo "ERROR: --persist-mode= needs a value" >&2; exit "$EXIT_ENV"; }
+        [ -n "${1#*=}" ] || { echo "ERROR: --persist-mode= needs a value" >&2; exit "$EXIT_USAGE"; }
         PERSIST_MODE="${1#*=}"; shift ;;
       --card)
-        [ $# -ge 2 ] || { echo "ERROR: --card needs a number" >&2; exit "$EXIT_ENV"; }
+        [ $# -ge 2 ] || { echo "ERROR: --card needs a number" >&2; exit "$EXIT_USAGE"; }
         OVERRIDE_CARD="$2"; shift 2 ;;
       --card=*)
-        [ -n "${1#*=}" ] || { echo "ERROR: --card= needs a number" >&2; exit "$EXIT_ENV"; }
+        [ -n "${1#*=}" ] || { echo "ERROR: --card= needs a number" >&2; exit "$EXIT_USAGE"; }
         OVERRIDE_CARD="${1#*=}"; shift ;;
       --chip)
-        [ $# -ge 2 ] || { echo "ERROR: --chip needs a value (e.g. ALC256)" >&2; exit "$EXIT_ENV"; }
+        [ $# -ge 2 ] || { echo "ERROR: --chip needs a value (e.g. ALC256)" >&2; exit "$EXIT_USAGE"; }
         OVERRIDE_CHIP="$2"; shift 2 ;;
       --chip=*)
-        [ -n "${1#*=}" ] || { echo "ERROR: --chip= needs a value" >&2; exit "$EXIT_ENV"; }
+        [ -n "${1#*=}" ] || { echo "ERROR: --chip= needs a value" >&2; exit "$EXIT_USAGE"; }
         OVERRIDE_CHIP="${1#*=}"; shift ;;
       --backup-dir)
-        [ $# -ge 2 ] || { echo "ERROR: --backup-dir needs a directory" >&2; exit "$EXIT_ENV"; }
+        [ $# -ge 2 ] || { echo "ERROR: --backup-dir needs a directory" >&2; exit "$EXIT_USAGE"; }
         BACKUP_DIR="$2"; shift 2 ;;
       --backup-dir=*)
-        [ -n "${1#*=}" ] || { echo "ERROR: --backup-dir= needs a directory" >&2; exit "$EXIT_ENV"; }
+        [ -n "${1#*=}" ] || { echo "ERROR: --backup-dir= needs a directory" >&2; exit "$EXIT_USAGE"; }
         BACKUP_DIR="${1#*=}"; shift ;;
       --log-file)
-        [ $# -ge 2 ] || { echo "ERROR: --log-file needs a path" >&2; exit "$EXIT_ENV"; }
+        [ $# -ge 2 ] || { echo "ERROR: --log-file needs a path" >&2; exit "$EXIT_USAGE"; }
         LOG_FILE_OVERRIDE="$2"; shift 2 ;;
       --log-file=*)
-        [ -n "${1#*=}" ] || { echo "ERROR: --log-file= needs a path" >&2; exit "$EXIT_ENV"; }
+        [ -n "${1#*=}" ] || { echo "ERROR: --log-file= needs a path" >&2; exit "$EXIT_USAGE"; }
         LOG_FILE_OVERRIDE="${1#*=}"; shift ;;
       --) shift; break ;;
-      -*) echo "ERROR: unknown option: $1 (see --help)" >&2; exit "$EXIT_ENV" ;;
-      *) echo "ERROR: unexpected argument: $1 (see --help)" >&2; exit "$EXIT_ENV" ;;
+      -*) echo "ERROR: unknown option: $1 (see --help)" >&2; exit "$EXIT_USAGE" ;;
+      *) echo "ERROR: unexpected argument: $1 (see --help)" >&2; exit "$EXIT_USAGE" ;;
     esac
   done
   if [ $# -gt 0 ]; then
-    echo "ERROR: unexpected argument: $1 (see --help)" >&2; exit "$EXIT_ENV"
+    echo "ERROR: unexpected argument: $1 (see --help)" >&2; exit "$EXIT_USAGE"
   fi
 
   case "$PERSIST_MODE" in
     modprobe|systemd|both) ;;
-    *) echo "ERROR: --persist-mode must be modprobe|systemd|both" >&2; exit "$EXIT_ENV" ;;
+    *) echo "ERROR: --persist-mode must be modprobe|systemd|both" >&2; exit "$EXIT_USAGE" ;;
   esac
   if [ -n "$OVERRIDE_CARD" ] && ! [[ "$OVERRIDE_CARD" =~ ^[0-9]+$ ]]; then
     echo "ERROR: --card must be a number, got: $OVERRIDE_CARD" >&2
-    exit "$EXIT_ENV"
+    exit "$EXIT_USAGE"
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Colors / logging (NO_COLOR + TTY aware, no emoji in file log)
+# Colors / markers (isatty + NO_COLOR + UTF-8 aware; log file stays ASCII)
 # ---------------------------------------------------------------------------
 USE_COLOR=0
-C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_MAGENTA=""; C_WHITE=""
+USE_UTF8=0
+C_RESET=""; C_BOLD=""; C_DIM=""; C_ACCENT=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_MAGENTA=""; C_WHITE=""
+M_OK="[ok]"; M_FAIL="[fail]"; M_WARN="[warn]"; M_BULLET="-"; M_ASK="?"; M_SKIP="[skip]"; M_SUB="->"
 init_colors() {
-  if [ "$NO_COLOR_FLAG" -eq 1 ]; then return 0; fi
-  if [ -n "${NO_COLOR:-}" ]; then return 0; fi
-  # TERM=dumb or no TTY -> no colors, still print ASCII art
-  if [ "${TERM:-}" = "dumb" ]; then return 0; fi
-  if [ -t 1 ] && command -v tput &>/dev/null; then
-    if tput colors &>/dev/null && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+  if [ "$NO_COLOR_FLAG" -eq 1 ] || [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; else
+    if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ] && [ -t 1 ] && command -v tput &>/dev/null; then
+      if tput colors &>/dev/null && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+        USE_COLOR=1
+        C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
+        C_ACCENT=$'\e[36m'
+        C_RED=$'\e[31m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'
+        C_BLUE=$'\e[36m'; C_CYAN=$'\e[36m'; C_MAGENTA=$'\e[35m'; C_WHITE=$'\e[37m'
+      fi
+    fi
+    if [ "$USE_COLOR" -eq 0 ] && [ -n "${CLICOLOR_FORCE:-}" ] && [ "${CLICOLOR_FORCE}" != "0" ]; then
       USE_COLOR=1
       C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
+      C_ACCENT=$'\e[36m'
       C_RED=$'\e[31m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'
-      C_BLUE=$'\e[34m'; C_MAGENTA=$'\e[35m'; C_CYAN=$'\e[36m'; C_WHITE=$'\e[37m'
+      C_BLUE=$'\e[36m'; C_CYAN=$'\e[36m'; C_MAGENTA=$'\e[35m'; C_WHITE=$'\e[37m'
     fi
+  fi
+  # UTF-8 markers only when the locale supports them; else ASCII fallback.
+  local codeset="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  if [[ "$codeset" =~ [Uu][Tt][Ff]-?8 ]]; then
+    USE_UTF8=1
+  elif [ "$(locale charmap 2>/dev/null || echo ASCII)" = "UTF-8" ]; then
+    USE_UTF8=1
+  fi
+  if [ "$USE_UTF8" -eq 1 ]; then
+    M_OK="✔"; M_FAIL="✖"; M_WARN="!"; M_BULLET="•"; M_ASK="?"; M_SKIP="–"; M_SUB="↳"
+  else
+    M_OK="[ok]"; M_FAIL="[fail]"; M_WARN="[warn]"; M_BULLET="-"; M_ASK="?"; M_SKIP="[skip]"; M_SUB="->"
   fi
 }
 
 LOG_FILE=""
 init_log() {
+  local _log_ok _logroot _canon
   if [ -n "$LOG_FILE_OVERRIDE" ]; then
-    case "$LOG_FILE_OVERRIDE" in
-      /tmp/*|/var/tmp/*|/var/log/*) ;;
-      *) echo "ERROR: --log-file must be under /tmp, /var/tmp, or /var/log (got: $LOG_FILE_OVERRIDE)" >&2; exit "$EXIT_ENV" ;;
+    _log_ok=0
+    _canon="$(canon_path "$LOG_FILE_OVERRIDE")"
+    case "$_canon" in
+      /tmp/*|/var/tmp/*|/var/log/*|/var/lib/audiofix/*) _log_ok=1 ;;
     esac
+    if [ -n "${HOME:-}" ]; then
+      case "$_canon" in "${HOME}"/.local/state/audiofix/*) _log_ok=1 ;; esac
+    fi
+    if [ "$_log_ok" -eq 0 ]; then
+      echo "ERROR: --log-file must be under /tmp, /var/tmp, /var/log, /var/lib/audiofix, or ~/.local/state/audiofix" >&2
+      exit "$EXIT_USAGE"
+    fi
     [ -L "$LOG_FILE_OVERRIDE" ] && { echo "ERROR: --log-file must not be a symlink" >&2; exit "$EXIT_ENV"; }
     LOG_FILE="$LOG_FILE_OVERRIDE"
     : > "$LOG_FILE" 2>/dev/null || { echo "ERROR: cannot write log: $LOG_FILE" >&2; exit "$EXIT_ENV"; }
     chmod 600 "$LOG_FILE" 2>/dev/null || true
   else
-    LOG_FILE=$(mktemp -p "${TMPDIR:-/var/tmp}" audiofix.XXXXXX.log 2>/dev/null || mktemp /var/tmp/audiofix.XXXXXX.log 2>/dev/null || mktemp /tmp/audiofix.XXXXXX.log 2>/dev/null) || { echo "ERROR: cannot create log file" >&2; exit "$EXIT_ENV"; }
+    _logroot="$(default_backup_root)"
+    mkdir -p "$_logroot" 2>/dev/null || _logroot="/var/tmp"
+    LOG_FILE=$(mktemp -p "$_logroot" audiofix.XXXXXX.log 2>/dev/null || mktemp /var/tmp/audiofix.XXXXXX.log 2>/dev/null || mktemp /tmp/audiofix.XXXXXX.log 2>/dev/null) || { echo "ERROR: cannot create log file" >&2; exit "$EXIT_ENV"; }
     chmod 600 "$LOG_FILE" 2>/dev/null || true
   fi
   # prune logs older than 7 days (best effort)
-  find /tmp /var/tmp -maxdepth 1 -name 'audiofix.*.log' -o -maxdepth 1 -name 'audiofix-*.log' -mtime +7 -delete 2>/dev/null || true
+  find /var/lib/audiofix /var/tmp /tmp "${HOME:-/nonexistent}/.local/state/audiofix" -maxdepth 1 -name 'audiofix.*.log' -mtime +7 -delete 2>/dev/null || true
 }
 
 log_plain() { printf '%s\n' "$1" >>"$LOG_FILE" 2>/dev/null || true; }
+canon_path() {
+  # Resolve .. and symlinks for allowlist checks (best effort).
+  if command -v realpath &>/dev/null; then
+    realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
 log() {
   local msg="$1"
   printf '%b\n' "$msg" | tee -a "$LOG_FILE" >/dev/null 2>&1 || printf '%b\n' "$msg"
   if [ "$QUIET" -eq 0 ]; then printf '%b\n' "$msg"; fi
 }
-# --- TTY UI (ASCII-only, color-gated) ---
-# All helpers log a plain-ASCII twin so $LOG_FILE stays grep-friendly.
-STEP_N=0
-rule() {
-  local w="${1:-${COLUMNS:-68}}" _rule
-  [[ "$w" =~ ^[0-9]+$ ]] || w=68
-  [ "$w" -gt 78 ] && w=78
-  [ "$w" -lt 20 ] && w=68
-  printf -v _rule '%*s' "$w" ""
-  log "${C_DIM}${_rule// /-}${C_RESET}"; log_plain "----------------------------------------------------------------------"
-}
+# --- Screen output: one marker set, one accent color ---
+# Markers are UTF-8 when the locale supports them, ASCII otherwise.
+# The log file always gets the ASCII form so it stays grep-friendly.
 banner() {
-  # Calm header. Intro lines kept verbatim. No art, no duplicate title.
+  # Calm header. Tagline + version. Log path prints once at the end, not here.
   SECONDS=0
-  STEP_N=0
-  log "${C_BOLD}AudioFix${C_RESET}"
-  log "Fix audio issue in Linux based operating systems."
-  log_plain "AudioFix"
-  log_plain "Fix audio issue in Linux based operating systems."
-  rule 68
-  log "  Log : $LOG_FILE"
-  if [ -n "${BACKUP_DIR:-}" ]; then log "  Backup : $BACKUP_DIR"; fi
-  if [ "$DRY_RUN" -eq 1 ]; then log "  Mode: ${C_BOLD}${C_YELLOW}[ DRY-RUN ]${C_RESET} no changes will be made"; log_plain "  Mode: [ DRY-RUN ]"; fi
+  log "${C_BOLD}AudioFix ${VERSION}${C_RESET} - fix silent or crackling audio on Linux"
+  log_plain "AudioFix ${VERSION} - fix silent or crackling audio on Linux"
+  if [ "$DRY_RUN" -eq 1 ]; then log "  Preview only - nothing will change"; log_plain "  Preview only"; fi
 }
-timer_fmt() { local s="${1:-0}"; printf '%02d:%02d' $((s/60)) $((s%60)); }
-step() {
-  # Calm: file always, screen only in --verbose. No rulers/timers by default.
+section() {
+  # Short section header, always visible. One line, one accent color.
   local title="$1"
+  log ""
+  log "${C_BOLD}${C_ACCENT}${title}${C_RESET}"
   log_plain ""
+  log_plain "== ${title} =="
+}
+step() {
+  # Internal progress: log file always, screen only in --verbose.
+  local title="$1"
   log_plain ">> ${title}"
   if [ "$VERBOSE" -eq 1 ]; then
     log ""
-    log "${C_BOLD}${C_BLUE}>> ${title}${C_RESET}"
+    log "${C_BOLD}${C_ACCENT}>> ${title}${C_RESET}"
   fi
 }
-info() { log "${C_CYAN}   ::${C_RESET} $1"; log_plain "   :: $1"; }
-ok()   { log "${C_GREEN}  [OK]${C_RESET} $1"; log_plain "  [OK] $1"; }
-warn() { local m="$1"; log "${C_YELLOW}  [!!]${C_RESET} $m"; log_plain "  [!!] $m"; }
-err()  { local m="$1"; printf '%s\n' "  [XX] $m" >>"$LOG_FILE" 2>/dev/null || true; printf '%b\n' "${C_RED}  [XX]${C_RESET} $m" >&2; }
+info() { log "${C_ACCENT}  ${M_BULLET}${C_RESET} $1"; log_plain "  - $1"; }
+ok()   { log "${C_GREEN}  ${M_OK}${C_RESET} $1"; log_plain "  [ok] $1"; }
+warn() { local m="$1"; log "${C_YELLOW}  ${M_WARN}${C_RESET} $m"; log_plain "  [warn] $m"; }
+err()  { local m="$1"; printf '%s\n' "  [fail] $m" >>"$LOG_FILE" 2>/dev/null || true; printf '%b\n' "${C_RED}  ${M_FAIL}${C_RESET} $m" >&2; if [ -z "$JSON_DETAIL" ]; then JSON_DETAIL="$m"; fi; }
 die()  { err "$1"; exit "${2:-$EXIT_ENV}"; }
-summary_box() {
-  # Dynamic width box, ASCII-only. Top and bottom same length.
-  local title="$1"; shift
-  local line mx=0 w bar top
-  for line in "$@"; do [ "${#line}" -gt "$mx" ] && mx="${#line}"; done
-  [ "${#title}" -gt "$mx" ] && mx="${#title}"
-  w=$((mx + 8)); [ "$w" -lt 50 ] && w=50; [ "$w" -gt 76 ] && w=76
-  printf -v bar '%*s' "$w" ""; bar="${bar// /-}"
-  printf -v top '+-- %s %s' "$title" "$bar"
-  top="${top:0:$w}"
-  log ""
-  log "${C_BOLD}${C_GREEN}${top}${C_RESET}"
-  for line in "$@"; do
-    log "${C_BOLD}${C_GREEN}|${C_RESET} ${line}"
-    log_plain "  ${line}"
-  done
-  log "${C_BOLD}${C_GREEN}${bar:0:$w}${C_RESET}"
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/\t/\\t/g' | tr '\n\r' '  ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037'; }
+json_emit() {
+  [ "$JSON" -eq 1 ] || return 0
+  [ "$JSON_EMITTED" -eq 0 ] || return 0
+  JSON_EMITTED=1
+  printf '{"version":"%s","status":"%s","detail":"%s","chip":"%s","card":"%s","persist":"%s","heard":"%s","reboot":"%s","log":"%s"}\n' \
+    "$(json_escape "$VERSION")" "$(json_escape "$JSON_STATUS")" "$(json_escape "$JSON_DETAIL")" \
+    "$(json_escape "$MODEL")" "$(json_escape "$CARD_NUM")" "$(json_escape "$PERSIST")" \
+    "$(json_escape "$HEARD")" "$(json_escape "$WANT_REBOOT")" "$(json_escape "$LOG_FILE")"
 }
 # --- Visible prompt helper (root cause fix) ---
 # Old bug: `read -rp "Q" v </dev/tty 2>/dev/null` hides the question,
@@ -319,26 +347,44 @@ can_prompt() {
   return 0
 }
 ask() {
-  # $1 = question text (e.g. "Reboot now? [y/N]:"), $2 = default, $3 = var name
-  # Never logs the answer (future-proof: answers could be sensitive).
+  # $1 = question text (no leading "?"), $2 = default, $3 = var name.
+  # Prints visibly via /dev/tty. Echoes the default when Enter is empty
+  # (typed input is already echoed by the terminal - never print it twice).
   local question="$1" def="$2" __var="$3"
-  local ans=""
-  # Visible on screen even when stdin is piped: print explicitly, flush.
-  # NOTE: no extra echo of $ans to /dev/tty here - the terminal already
-  # echoes input in canonical mode, extra printf caused double "y" lines.
-  printf '%s ' "$question" > /dev/tty 2>/dev/null || printf '%s ' "$question"
+  local ans="" typed_empty=0
+  printf '%b?%b %s ' "$C_ACCENT" "$C_RESET" "$question" > /dev/tty 2>/dev/null \
+    || printf '? %s ' "$question"
   log_plain "ASK: $question (default=${def})"
   if ! IFS= read -r -t 60 ans </dev/tty; then ans=""; fi
+  if [ -z "$ans" ]; then
+    typed_empty=1
+    printf '%s\n' "$def" > /dev/tty 2>/dev/null || true
+  fi
   ans="${ans:-$def}"
   printf -v "$__var" '%s' "$ans"
+  if [ "$typed_empty" -eq 1 ]; then
+    log "  Chose: $ans (default)"
+  fi
+  log_plain "CHOSE: $ans"
 }
 # --- Plain prompts only (no external TUI deps by design) ---
 # gum/fzf/dialog intentionally not used: keep curl|bash predictable.
 confirm_yn() {
   # $1 = question, $2 = default Y/N. Returns 0=yes, 1=no. Pure bash.
-  local question="$1" def="$2" ans=""
-  ask "$question" "$def" ans
-  case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+  # Accepts y/yes/n/no, re-asks anything else (max 3 tries, then default).
+  local question="$1" def="$2" ans="" tries=0
+  while [ "$tries" -lt 3 ]; do
+    ask "$question" "$def" ans
+    case "$ans" in
+      [Yy]|[Yy][Ee][Ss]) return 0 ;;
+      [Nn]|[Nn][Oo]) return 1 ;;
+      *)
+        log "? Please answer y or n."
+        tries=$((tries + 1))
+        ;;
+    esac
+  done
+  case "$def" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
 run() {
@@ -353,7 +399,6 @@ run() {
     local code="${PIPESTATUS[0]}"
     return "$code"
   else
-    if [ "$QUIET" -eq 0 ]; then log "  \$ $*"; fi
     "$@" >>"$LOG_FILE" 2>&1
     return $?
   fi
@@ -390,16 +435,26 @@ init_sudo() {
     return 0
   fi
   if ! command -v sudo &>/dev/null; then
-    die "sudo not found and not running as root. Re-run as root." "$EXIT_ENV"
+    die "No administrator rights. This fix changes system audio settings. Ask an administrator, or re-run as root." "$EXIT_ROOT"
   fi
   if [ "$DRY_RUN" -eq 0 ] && [ "$LIST_CHIPS_ONLY" -eq 0 ]; then
+    info "This fix changes system audio settings, so it needs administrator rights once."
     if ! sudo -v; then
-      die "Could not acquire sudo privileges. Aborting." "$EXIT_ENV"
+      die "Could not get administrator rights. Nothing was changed. Ask an administrator, or re-run as root." "$EXIT_ROOT"
     fi
     ( while true; do sudo -v; sleep 60; done ) &
     SUDO_KEEPALIVE_PID=$!
   fi
   SUDO="sudo"
+}
+acquire_lock() {
+  if [ -L "$LOCK_DIR" ]; then
+    die "Refusing unsafe lock path (symlink): $LOCK_DIR" "$EXIT_ENV"
+  fi
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die "Another AudioFix run is in progress. If that is wrong, remove $LOCK_DIR and try again." "$EXIT_ENV"
+  fi
+  LOCK_CREATED=1
 }
 cleanup() {
   if [ -n "$SUDO_KEEPALIVE_PID" ]; then
@@ -407,6 +462,24 @@ cleanup() {
     wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
     SUDO_KEEPALIVE_PID=""
   fi
+  if [ "$LOCK_CREATED" -eq 1 ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_CREATED=0
+  fi
+  json_emit
+}
+on_interrupt() {
+  JSON_STATUS="aborted"
+  JSON_DETAIL="Stopped by user"
+  cleanup
+  trap - EXIT INT TERM HUP
+  err "Stopped. Your sound settings may be half-applied."
+  if [ -n "${BACKUP_DIR:-}" ] && [ -d "$BACKUP_DIR" ]; then
+    err "Undo with: $0 --restore \"$BACKUP_DIR\""
+  else
+    err "Run again to retry, or restore a backup from a previous run."
+  fi
+  exit "$EXIT_ABORT"
 }
 stop_keepalive() {
   if [ -n "$SUDO_KEEPALIVE_PID" ]; then
@@ -488,23 +561,7 @@ chip_model_hint() {
   esac
 }
 
-chip_desc() {
-  case "$1" in
-    ALC255) echo "Most common laptop HDA (Acer/ASUS/Dell)" ;;
-    ALC256|ALC3246) echo "Laptop HDA (ALC3246 = Dell rebrand of ALC256)" ;;
-    ALC257) echo "ThinkPad X/T HDA (SSID bug 17aa:0000 common)" ;;
-    ALC269) echo "Reference laptop HDA (huge kernel quirk table)" ;;
-    ALC287|ALC3306) echo "Modern laptop HDA, often + CS35L41 smart-amp (Lenovo/ASUS/HP)" ;;
-    ALC1220) echo "Flagship desktop HDA (incl. ALC1220P/VB, S1220A, ALC1250/ALC1200 family)" ;;
-    ALC892|ALC897) echo "Common desktop HDA (budget/gaming boards)" ;;
-    ALC4080|ALC4082) echo "USB 2.0 onboard audio (looks like HDA in specs, is USB)" ;;
-    ALC4040|ALC4050|ALC4070) echo "USB headset/dongle/bridge" ;;
-    RT5682|RT715|RT714|RT1318) echo "I2S/SoundWire companion (SOF firmware, not HDA)" ;;
-    *) echo "Realtek audio codec" ;;
-  esac
-}
 
-is_hda_safe() { [ "$(chip_iface "$1")" = "HDA" ]; }
 
 # Generic EAPD/coef init verbs (original fix). Volatile - needs persistence.
 GENERIC_VERBS=("0x20 0x500 0x1b" "0x20 0x477 0x4a4b" "0x20 0x500 0xf" "0x20 0x477 0x74")
@@ -512,11 +569,34 @@ GENERIC_VERBS=("0x20 0x500 0x1b" "0x20 0x477 0x4a4b" "0x20 0x500 0xf" "0x20 0x47
 # ---------------------------------------------------------------------------
 # OS / package management (no sourcing os-release, apt update once)
 # ---------------------------------------------------------------------------
-OS_ID=""; OS_LIKE=""; APT_UPDATED=0
+OS_ID=""; OS_LIKE=""; OS_PRETTY="Linux"; APT_UPDATED=0
 detect_os() {
   if [ -f /etc/os-release ]; then
     OS_ID=$(grep -E '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | LC_ALL=C tr -d '"' | LC_ALL=C tr '[:upper:]' '[:lower:]' || true)
     OS_LIKE=$(grep -E '^ID_LIKE=' /etc/os-release 2>/dev/null | cut -d= -f2 | LC_ALL=C tr -d '"' | LC_ALL=C tr '[:upper:]' '[:lower:]' || true)
+    OS_PRETTY=$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | LC_ALL=C tr -d '"' || echo "Linux")
+    if [ -z "$OS_PRETTY" ]; then OS_PRETTY="Linux"; fi
+  fi
+  return 0
+}
+install_hint() {
+  # $1 = missing tool. Prints how to install it on this distro.
+  case "${OS_LIKE} ${OS_ID}" in
+    *arch*) echo "sudo pacman -S alsa-utils alsa-tools" ;;
+    *debian*|*ubuntu*|*mint*|*pop*|*kali*|*raspbian*) echo "sudo apt-get install -y alsa-utils alsa-tools" ;;
+    *fedora*|*rhel*|*centos*|*rocky*|*alma*) echo "sudo dnf install -y alsa-utils alsa-tools" ;;
+    *suse*|*opensuse*) echo "sudo zypper install alsa-utils alsa-tools" ;;
+    *) echo "install alsa-utils and alsa-tools with your package manager" ;;
+  esac
+}
+detect_stack() {
+  # PipeWire, PulseAudio, or bare ALSA. Best effort, never fails.
+  if pgrep -x pipewire &>/dev/null || pgrep -x pipewire-pulse &>/dev/null; then
+    SOUND_SERVER="PipeWire"
+  elif pgrep -x pulseaudio &>/dev/null || command -v pactl &>/dev/null; then
+    SOUND_SERVER="PulseAudio"
+  else
+    SOUND_SERVER="ALSA"
   fi
 }
 
@@ -592,7 +672,9 @@ pkg_install() {
     *nixos*)
       die "NixOS detected: cannot imperatively install. Add to environment.systemPackages: alsa-utils alsa-tools alsa-ucm-conf pciutils usbutils" "$EXIT_PKG" ;;
     *)
-      warn "Unrecognized distro (ID=${OS_ID:-?} LIKE=${OS_LIKE:-?}). Trying known managers in order..."
+      warn "Unknown distro, trying standard tools..."
+      log_plain "distro: ID=${OS_ID:-?} LIKE=${OS_LIKE:-?}"
+      if [ "$VERBOSE" -eq 1 ]; then info "Distro IDs: ${OS_ID:-?} / ${OS_LIKE:-?}"; fi
       if command -v pacman &>/dev/null; then run $SUDO pacman -Sy --needed --noconfirm alsa-utils alsa-tools && return 0 || true; fi
       if command -v apt-get &>/dev/null; then run $SUDO apt-get install -y alsa-utils alsa-tools && return 0 || true; fi
       if command -v dnf &>/dev/null; then run $SUDO dnf install -y alsa-utils alsa-tools && return 0 || true; fi
@@ -604,27 +686,25 @@ pkg_install() {
 }
 
 ensure_deps() {
-  step "[1/6] Checking dependencies"
   detect_os
-  info "Distro: ID=${OS_ID:-unknown} LIKE=${OS_LIKE:-none}"
+  detect_stack
   if ! command -v alsamixer &>/dev/null; then
-    info "Installing alsa-utils..."
-    pkg_install alsa-utils || die "Failed to install alsa-utils" "$EXIT_PKG"
+    info "Installing sound tools..."
+    pkg_install alsa-utils || die "Could not install sound tools. They change mixer settings like Auto-Mute. Try: $(install_hint alsamixer)" "$EXIT_PKG"
     if ! command -v alsamixer &>/dev/null && [ "$DRY_RUN" -eq 0 ]; then
-      die "alsa-utils install reported success but alsamixer still missing" "$EXIT_PKG"
+      die "Install finished but alsamixer is still missing. Try: $(install_hint alsamixer)" "$EXIT_PKG"
     fi
-  else ok "alsamixer found ($(command -v alsamixer))"; fi
+  fi
   if ! command -v hda-verb &>/dev/null; then
-    info "Installing alsa-tools (provides hda-verb)..."
-    pkg_install alsa-tools || die "Failed to install alsa-tools" "$EXIT_PKG"
+    info "Installing chip tools..."
+    pkg_install alsa-tools || die "Could not install chip tools. They send startup commands to the audio chip. Try: $(install_hint hda-verb)" "$EXIT_PKG"
     if ! command -v hda-verb &>/dev/null && [ "$DRY_RUN" -eq 0 ]; then
-      die "alsa-tools install reported success but hda-verb still missing" "$EXIT_PKG"
+      die "Couldn't find hda-verb. It's needed to talk to the audio chip. Install it: $(install_hint hda-verb)" "$EXIT_PKG"
     fi
-  else ok "hda-verb found ($(command -v hda-verb))"; fi
+  fi
   # diag tools are best-effort (detection still works without them)
   if ! command -v lspci &>/dev/null || ! command -v lsusb &>/dev/null; then
-    info "Installing pciutils/usbutils for better detection (best effort)..."
-    pkg_install diag || warn "Could not install diag tools; detection will use fallbacks"
+    pkg_install diag || { if [ "$VERBOSE" -eq 1 ]; then warn "Extra detection tools unavailable; using fallbacks"; fi; }
   fi
 }
 
@@ -640,7 +720,7 @@ USB_HINT=""
 SOF_HINT=""
 
 detect_chips() {
-  step "[2/6] Detecting Realtek audio"
+  step "Detecting audio chip"
   FOUND_CARDS=(); FOUND_CODECS=(); FOUND_MODELS=(); FOUND_IFACES=(); FOUND_METHOD=""
 
   # 1) Authoritative: /proc/asound/card*/codec#*
@@ -682,7 +762,8 @@ detect_chips() {
 
   # 2) Fallback: aplay -l (low confidence), locale-stable, no -P
   if [ "${#FOUND_MODELS[@]}" -eq 0 ] && [ -z "$OVERRIDE_CARD" ]; then
-    warn "No codec in /proc/asound; trying 'aplay -l' fallback (LOW confidence)"
+    log_plain "No codec in /proc/asound; aplay -l fallback"
+    if [ "$VERBOSE" -eq 1 ]; then warn "No codec in /proc/asound; trying device-list fallback"; fi
     if command -v aplay &>/dev/null; then
       while IFS= read -r line; do
         local tok card
@@ -701,9 +782,10 @@ detect_chips() {
   fi
 
   # 3) USB audio hint (audio-class aware, not bare 0bda which false-positives on WiFi)
+  # Sanitized: USB descriptors are external input, strip escape/control chars.
   if command -v lsusb &>/dev/null; then
     local usb_audio
-    usb_audio=$(lsusb 2>/dev/null | grep -iE 'audio|headset|ALC40[0-9]{2}|0bda:.*(audio|4050|4040|4070|4080|4082)' || true)
+    usb_audio=$(lsusb 2>/dev/null | grep -iE 'audio|headset|ALC40[0-9]{2}|0bda:.*(audio|4050|4040|4070|4080|4082)' | LC_ALL=C tr -d '\033\007\r' | head -c 300 || true)
     if [ -n "$usb_audio" ]; then USB_HINT="$usb_audio"; fi
     # Explicit ALC4080-class board VIDs (ASUS/MSI/Gigabyte rebrand the USB chip)
     if lsusb 2>/dev/null | grep -qE '0b05:(1996|1a20|1a27|1a5c)|0db0:(1feb|419c|a073|7696|82c7|005a|151f)|0414:a0'; then
@@ -720,8 +802,15 @@ detect_chips() {
   if dmesg 2>/dev/null | grep -qiE 'CSC3551|CS35L41|sof-audio|rt5682|rt715|rt1318|snd_sof'; then
     SOF_HINT="${SOF_HINT:+$SOF_HINT; }SOF/smart-amp marker in dmesg"
   fi
-  if [ -n "$USB_HINT" ]; then warn "USB audio hint: $USB_HINT"; fi
-  if [ -n "$SOF_HINT" ]; then warn "SOF/smart-amp hint: $SOF_HINT (speakers may need SOF firmware/amp quirk, not just hda-verb)"; fi
+  if [ -n "$USB_HINT" ]; then
+    log_plain "USB hint: $USB_HINT"
+    if [ "$VERBOSE" -eq 1 ]; then warn "USB audio hint: $USB_HINT"; fi
+  fi
+  if [ -n "$SOF_HINT" ]; then
+    warn "Extra sound hardware found (see log); the chip fix alone may not be enough."
+    log_plain "SOF hint: $SOF_HINT"
+    if [ "$VERBOSE" -eq 1 ]; then info "SOF detail: $SOF_HINT"; fi
+  fi
 
   # 5) Explicit overrides
   if [ -n "$OVERRIDE_CHIP" ] || [ -n "$OVERRIDE_CARD" ]; then
@@ -735,19 +824,25 @@ detect_chips() {
   fi
 
   if [ "${#FOUND_MODELS[@]}" -eq 0 ]; then
-    err "No Realtek codec detected."
-    err "Tried: /proc/asound/card*/codec#*, aplay -l. Hints: USB='${USB_HINT:-none}' SOF='${SOF_HINT:-none}'"
-    info "Tip: run with --list-chips, or force with --card N --chip ALCxxx --force"
-    info "Tip: for ALC4080/82 (USB) see 'USB branch' in --help; for SOF laptops check sof-firmware"
+    JSON_STATUS="unsupported"
+    err "No supported audio chip found."
+    err "Checked the sound cards and the device list - nothing matches."
+    info "If no sound card shows up at all, check that it is enabled in BIOS."
+    info "Next: run with --list-chips to see what was found."
+    info "USB sound (ALC4080 and similar) needs different settings, not this fix."
     return "$EXIT_NO_CHIP"
   fi
 
-  ok "Detected ${#FOUND_MODELS[@]} codec(s) via $FOUND_METHOD"
+  if [ "${#FOUND_MODELS[@]}" -eq 1 ]; then
+    ok "Audio chip: Realtek ${FOUND_MODELS[0]} (card ${FOUND_CARDS[0]})"
+  else
+    ok "Found ${#FOUND_MODELS[@]} audio chips"
+  fi
+  if [ "$VERBOSE" -eq 1 ]; then info "Detection: $FOUND_METHOD"; fi
   for i in "${!FOUND_MODELS[@]}"; do
-    log "  [$i] ${FOUND_MODELS[$i]} (card ${FOUND_CARDS[$i]})"
     log_plain "  [$i] ${FOUND_MODELS[$i]} ${FOUND_IFACES[$i]} card=${FOUND_CARDS[$i]} codec=${FOUND_CODECS[$i]}"
     if [ "$VERBOSE" -eq 1 ]; then
-      log "      iface=${FOUND_IFACES[$i]} codec=${FOUND_CODECS[$i]}: $(chip_desc "${FOUND_MODELS[$i]}")"
+      log "  [$i] ${FOUND_MODELS[$i]} (card ${FOUND_CARDS[$i]})"
     fi
   done
   if [ -n "$USB_HINT" ]; then
@@ -758,6 +853,7 @@ detect_chips() {
 
 list_chips() {
   if ! detect_chips; then exit "$EXIT_NO_CHIP"; fi
+  if [ "$JSON" -eq 1 ]; then return 0; fi
   if [ "$QUIET" -eq 0 ]; then
     echo ""
     echo "Detected chips (no changes made):"
@@ -774,27 +870,26 @@ list_chips() {
 }
 
 choose_chip() {
-  # Calm wizard Q1 (only when ambiguous). Pure bash, max 2 prompts here.
+  # One prompt when ambiguous (pure bash). --card N / --yes skips it.
   SELECTED_INDEX=0
   if [ "${#FOUND_MODELS[@]}" -gt 1 ] && [ -z "$OVERRIDE_CARD" ]; then
-    log "Found ${#FOUND_MODELS[@]} codecs:"
+    log "Found ${#FOUND_MODELS[@]} sound cards:"
     for i in "${!FOUND_MODELS[@]}"; do
-      log "  [$i] ${FOUND_MODELS[$i]} (card ${FOUND_CARDS[$i]})"
+      log "  [$i] Realtek ${FOUND_MODELS[$i]} (card ${FOUND_CARDS[$i]})"
     done
     if can_prompt; then
-      local use="" sel=""
-      ask "1/3 Use [0] ${FOUND_MODELS[0]} card ${FOUND_CARDS[0]}? [Y/n]:" "Y" use
-      case "$use" in
-        ""|[Yy]*)
-          SELECTED_INDEX=0
-          log_plain "CHOICE: default 0"
+      local sel=""
+      ask "Which one to fix? Enter number [0] (or n to stop):" "0" sel
+      case "$sel" in
+        [Nn]|[Nn][Oo])
+          info "Stopped. Nothing was changed."
+          exit "$EXIT_ABORT"
           ;;
         *)
-          ask "Enter number [0-$(( ${#FOUND_MODELS[@]} - 1 ))]:" "0" sel
           if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -lt "${#FOUND_MODELS[@]}" ]; then
             SELECTED_INDEX="$sel"
           else
-            warn "Bad choice, using 0"
+            warn "Not a valid number - using 0."
             SELECTED_INDEX=0
           fi
           log_plain "CHOICE: $SELECTED_INDEX"
@@ -808,24 +903,50 @@ choose_chip() {
   CARD_NUM="${FOUND_CARDS[$SELECTED_INDEX]}"
   CODEC_NUM="${FOUND_CODECS[$SELECTED_INDEX]}"
   IFACE="${FOUND_IFACES[$SELECTED_INDEX]}"
-  ok "Selected: $MODEL (iface=$IFACE) card=$CARD_NUM codec=$CODEC_NUM"
-  info "Known quirk hint: model=$(chip_model_hint "$MODEL")"
+  if [ "${#FOUND_MODELS[@]}" -eq 1 ] && [ -z "$OVERRIDE_CARD" ]; then
+    : # already announced above; stay quiet
+  else
+    ok "Using: Realtek $MODEL (card $CARD_NUM)"
+  fi
+  log_plain "Tuning profile: $(chip_model_hint "$MODEL")"
 }
 
 # ---------------------------------------------------------------------------
 # Backup
 # ---------------------------------------------------------------------------
 BACKUP_STATE_FILE=""
+default_backup_root() {
+  # Stable home first, temp fallback last. Never /var/tmp by default.
+  if [ -w /var/lib/audiofix 2>/dev/null ] || { [ "${EUID:-$(id -u)}" -eq 0 ] && mkdir -p /var/lib/audiofix 2>/dev/null; }; then
+    printf '%s' "/var/lib/audiofix"
+  elif [ -n "${HOME:-}" ] && [ -w "${HOME}" 2>/dev/null ]; then
+    printf '%s' "${HOME}/.local/state/audiofix"
+  else
+    printf '%s' "/var/tmp"
+  fi
+}
 backup_alsa() {
-  step "[3/6] Backing up ALSA state"
   local base="${BACKUP_DIR:-}"
   if [ -z "$base" ]; then
-    if [ -w /var/tmp 2>/dev/null ]; then base="/var/tmp/audiofix-backup-$(date +%Y%m%d-%H%M%S)-$$"
-    else base="/tmp/audiofix-backup-$(date +%Y%m%d-%H%M%S)-$$"; fi
+    BACKUP_ROOT="$(default_backup_root)"
+    mkdir -p "$BACKUP_ROOT" 2>/dev/null || true
+    base="$BACKUP_ROOT/audiofix-backup-$(date +%Y%m%d-%H%M%S)"
   fi
-  case "$base" in
-    /var/tmp/audiofix-backup-*|/tmp/audiofix-backup-*) ;;
-    *) die "Refusing backup outside /var/tmp/audiofix-backup-* or /tmp/audiofix-backup-* (got: $base). Use --backup-dir with one of those prefixes." "$EXIT_ENV" ;;
+  local _home="${HOME:-}"
+  local _canon
+  _canon="$(canon_path "$base")"
+  case "$_canon" in
+    /var/lib/audiofix/*|/var/tmp/audiofix-backup-*|/tmp/audiofix-backup-*) ;;
+    *)
+      if [ -n "$_home" ]; then
+        case "$_canon" in
+          "$_home"/.local/state/audiofix/*) ;;
+          *) die "Refusing backup outside /var/lib/audiofix, ~/.local/state/audiofix, or /var/tmp/audiofix-backup-* (got: $base)." "$EXIT_USAGE" ;;
+        esac
+      else
+        die "Refusing backup outside /var/lib/audiofix or /var/tmp/audiofix-backup-* (got: $base)." "$EXIT_USAGE"
+      fi
+      ;;
   esac
   [ -L "$base" ] && die "Refusing backup through symlink: $base" "$EXIT_ENV"
   BACKUP_DIR="$base"
@@ -836,7 +957,9 @@ backup_alsa() {
   if command -v alsactl &>/dev/null; then
     if $SUDO alsactl store -f "$BACKUP_STATE_FILE" >>"$LOG_FILE" 2>&1; then
       chmod 600 "$BACKUP_STATE_FILE" 2>/dev/null || true
-      ok "ALSA state backed up to $BACKUP_STATE_FILE"
+      ok "Backed up current settings"
+      if [ "$VERBOSE" -eq 1 ]; then info "Backup: $BACKUP_STATE_FILE"; fi
+      log_plain "Backup: $BACKUP_STATE_FILE"
     else warn "alsactl backup failed (live-USB/immutable /var?) continuing anyway"; fi
   fi
   if command -v amixer &>/dev/null; then
@@ -853,7 +976,7 @@ backup_alsa() {
 # ALSA: disable Auto-Mute (ALL controls) + unmute essentials
 # ---------------------------------------------------------------------------
 fix_alsa() {
-  step "[4/6] Fixing ALSA mixer (Auto-Mute + unmute)"
+  step "Applying mixer fix"
   local controls
   controls=$(amixer -c "$CARD_NUM" controls 2>/dev/null | grep -i "Auto-Mute" || true)
   if [ -z "$controls" ]; then
@@ -887,16 +1010,30 @@ fix_alsa() {
       if [ "$done_ctl" -eq 0 ]; then warn "Could not disable '$ctl' (tried Disabled/Off)"; fi
     done <<< "$controls"
     AUTOMUTE_DONE=$fixed; AUTOMUTE_TOTAL=$total
-    info "Auto-Mute: $fixed/$total off"
+    if [ "$fixed" -gt 0 ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then info "Preview: would turn off Auto-Mute"
+      else ok "Auto-Mute turned off"; fi
+    else info "Auto-Mute was already off"; fi
   fi
 
-  info "Unmuting essentials (Master/Headphone/Speaker/PCM @80%)..."
+  local unmuted=()
   for ctl in Master Headphone Speaker PCM Front; do
     if amixer -c "$CARD_NUM" scontrols 2>/dev/null | grep -q "'$ctl'"; then
-      if [ "$DRY_RUN" -eq 1 ]; then log "  (dry-run) would run: amixer -c $CARD_NUM sset $ctl 80% unmute"
-      else amixer -c "$CARD_NUM" sset "$ctl" 80% unmute >>"$LOG_FILE" 2>&1 || warn "Could not unmute $ctl"; fi
+      if [ "$DRY_RUN" -eq 1 ]; then
+        log_plain "  (dry-run) would unmute: $ctl"
+        unmuted+=("$ctl")
+      else
+        if amixer -c "$CARD_NUM" sset "$ctl" 80% unmute >>"$LOG_FILE" 2>&1; then
+          unmuted+=("$ctl")
+        else warn "Could not unmute $ctl"; fi
+      fi
     fi
   done
+  UNMUTED_LIST="${unmuted[*]:-none}"
+  if [ "${#unmuted[@]}" -gt 0 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then info "Preview: would unmute ${unmuted[*]} and set volume to 80%"
+    else ok "Unmuted ${unmuted[*]} (volume 80%)"; fi
+  fi
   if [ "$DRY_RUN" -eq 1 ]; then log "  (dry-run) would run: ${SUDO:-sudo} alsactl store"
   else
     if [ -z "${BACKUP_STATE_FILE:-}" ] || [ ! -s "$BACKUP_STATE_FILE" ]; then
@@ -923,27 +1060,41 @@ resolve_hda_dev() {
 }
 
 fix_hda_verbs() {
-  step "[5/6] Running hda-verb init (HDA only)"
+  step "Sending chip commands"
   if [ "$IFACE" = "USB" ]; then
-    warn "$MODEL is USB audio (iface=USB). hda-verb does NOT apply."
-    info "USB path: check 'alsamixer -c $CARD_NUM', PipeWire profile, and UCM:"
-    info "  cat /proc/asound/card${CARD_NUM}/usbmixer 2>/dev/null | head -20"
-    info "  grep -R ALC4080 /usr/share/alsa/ucm2/USB-Audio/ 2>/dev/null | head"
-    info "  Your board USB ID must be in USB-Audio.conf profile; else append VID:PID and restart pipewire."
+    warn "$MODEL is USB sound, so chip commands do not apply."
+    log_plain "USB path: usbmixer cat + ucm2 grep + VID:PID profile (card $CARD_NUM)"
+    if [ "$VERBOSE" -eq 1 ]; then
+      info "USB path: check the mixer, PipeWire profile, and USB sound settings:"
+      info "  cat /proc/asound/card${CARD_NUM}/usbmixer 2>/dev/null | head -20"
+      info "  grep -R ALC4080 /usr/share/alsa/ucm2/USB-Audio/ 2>/dev/null | head"
+      info "  Your board USB ID must be in USB-Audio.conf profile; else append VID:PID and restart pipewire."
+    fi
     if [ "$FORCE" -eq 0 ]; then warn "Skipping hda-verb (use --force to override, not recommended)"; return 0; fi
   fi
   if [ "$IFACE" = "SOF" ]; then
-    warn "$MODEL is I2S/SoundWire (iface=SOF). hda-verb does NOT apply."
-    info "SOF path: install sof-firmware/SOF topology, try:"
-    info "  options snd-intel-dspcfg dsp_driver=1  (or =3) in /etc/modprobe.d, then reboot"
+    warn "$MODEL needs firmware sound drivers, so chip commands do not apply."
+    log_plain "SOF path: sof-firmware/topology + dsp_driver option"
+    if [ "$VERBOSE" -eq 1 ]; then
+      info "SOF path: install sof-firmware/SOF topology, try:"
+      info "  options snd-intel-dspcfg dsp_driver=1  (or =3) in /etc/modprobe.d, then reboot"
+    fi
     if [ "$FORCE" -eq 0 ]; then warn "Skipping hda-verb (use --force to override)"; return 0; fi
   fi
   if [ "$MODEL" = "UNKNOWN-MODEL" ] || [ "$MODEL" = "UNKNOWN" ] || [ "$IFACE" = "UNKNOWN" ]; then
-    warn "Chip model unknown (model=$MODEL iface=$IFACE). Generic verbs may mis-pin codec."
+    warn "Your chip is not in the known list, so the standard commands may be wrong for it."
     if [ "$FORCE" -eq 0 ]; then
-      die "Refusing to run generic verbs on unknown codec. Re-run with --chip ALCxxx --force (see --list-chips)." "$EXIT_VERB"
+      JSON_STATUS="unsupported"
+      die "Stopped for safety: this chip is not in the known list, so the standard commands may be wrong for it. A backup was saved first. Re-run with --chip ALCxxx --force to try anyway." "$EXIT_HW"
     fi
-    warn "--force given: proceeding on unknown codec"
+    if can_prompt; then
+      if ! confirm_yn "Apply the standard commands anyway? [y/N]:" "N"; then
+        info "Stopped. Nothing was changed."
+        exit "$EXIT_ABORT"
+      fi
+    else
+      warn "--force given without a terminal; proceeding on unknown chip"
+    fi
   fi
   if [ "$APPLY_VERBS_ONLY" -eq 0 ] && [ -n "$SOF_HINT" ]; then
     warn "Smart-amp/SOF marker present: $SOF_HINT"
@@ -952,12 +1103,14 @@ fix_hda_verbs() {
 
   local hda_dev
   if ! hda_dev=$(resolve_hda_dev); then
-    die "No /dev/snd/hwC${CARD_NUM}D* node exists (card=$CARD_NUM codec=$CODEC_NUM). Is snd-hda-intel loaded?" "$EXIT_VERB"
+    JSON_STATUS="unsupported"
+    die "No sound device found for card $CARD_NUM. The audio driver may not be loaded yet. Try restarting, then run with --verbose and share the log." "$EXIT_HW"
   fi
   if [ "$hda_dev" != "/dev/snd/hwC${CARD_NUM}D${CODEC_NUM}" ]; then
-    warn "Exact node hwC${CARD_NUM}D${CODEC_NUM} missing; using $hda_dev (verified fallback)"
+    log_plain "Exact node hwC${CARD_NUM}D${CODEC_NUM} missing; using $hda_dev"
+    if [ "$VERBOSE" -eq 1 ]; then warn "Sound device path changed, using fallback."; fi
   fi
-  info "Target device: $hda_dev ($MODEL)"
+  info "Sending the $MODEL startup commands to the chip..."
   log_plain "Target: $hda_dev ($MODEL)"
   VERBS_OK=0; VERBS_TOTAL=${#GENERIC_VERBS[@]}
 
@@ -972,7 +1125,7 @@ fix_hda_verbs() {
   for cmd in "${GENERIC_VERBS[@]}"; do
     # shellcheck disable=SC2086
     if run $SUDO hda-verb "$hda_dev" $cmd; then ok_count=$((ok_count+1))
-    else warn "hda-verb failed: $cmd"; fail_count=$((fail_count+1)); fi
+    else warn "One chip command failed (details in the log)"; fail_count=$((fail_count+1)); fi
   done
   VERBS_OK=$ok_count
   # Persist verb list for the systemd replay unit (under private backup dir, not /tmp)
@@ -984,7 +1137,7 @@ fix_hda_verbs() {
     if [ "$VERBOSE" -eq 1 ]; then ok "All $ok_count hda-verb command(s) succeeded on $hda_dev"; fi
   else
     warn "$fail_count verb(s) failed (see $LOG_FILE)"
-    if [ "$APPLY_VERBS_ONLY" -eq 1 ]; then return "$EXIT_VERB"; fi
+    if [ "$APPLY_VERBS_ONLY" -eq 1 ]; then return "$EXIT_ENV"; fi
   fi
   # Record for persistence step
   HDA_DEV_USED="$hda_dev"
@@ -994,14 +1147,13 @@ fix_hda_verbs() {
 # Persistence: modprobe quirk + systemd replay (verbs are volatile)
 # ---------------------------------------------------------------------------
 persist_fix() {
-  step "[6/6] Persistence (survive reboot/suspend)"
+  step "Making it permanent"
   if [ "$PERSIST" = "no" ]; then info "Skipped (--no-persist)"; return 0; fi
   # Decided upfront in main (wizard Q2). Never asks here.
   if [ "$PERSIST" = "prompt" ]; then PERSIST="yes"; fi
   if [ "$IFACE" = "USB" ] || [ "$IFACE" = "SOF" ]; then
-    warn "Persistence for $IFACE is UCM/SOF based, not modprobe/hda-verb. Skipping unit install."
-    info "USB: add VID:PID to /usr/share/alsa/ucm2/USB-Audio/USB-Audio.conf"
-    info "SOF: /etc/modprobe.d/sof-fix.conf -> options snd-intel-dspcfg dsp_driver=3"
+    warn "Permanent setup for $IFACE sound works differently - skipping."
+    log_plain "USB: VID:PID ucm2 profile; SOF: dsp_driver option"
     return 0
   fi
   if [[ "$PERSIST_MODE" == "modprobe" || "$PERSIST_MODE" == "both" ]]; then
@@ -1094,18 +1246,52 @@ verify_fix() {
     local automute_state
     automute_state=$(amixer -c "$CARD_NUM" sget "Auto-Mute Mode" 2>/dev/null || amixer -c "$CARD_NUM" contents 2>/dev/null | grep -i -A1 "Auto-Mute" | head -5 || true)
     log_plain "amixer: $automute_state"
-    if [ "$VERBOSE" -eq 1 ]; then
-      if printf '%s' "$automute_state" | grep -q "Disabled"; then ok "Auto-Mute reads Disabled"
-      else info "amixer Auto-Mute state: ${automute_state:-unknown}"; fi
+    if printf '%s' "$automute_state" | grep -q "Disabled"; then
+      if [ "$VERBOSE" -eq 1 ]; then ok "Auto-Mute reads Disabled"; fi
+    else
+      warn "Auto-Mute still looks enabled. The fix may not hold - details in the log."
     fi
   fi
   if command -v aplay &>/dev/null; then LC_ALL=C aplay -l 2>/dev/null | head -10 >>"$LOG_FILE" 2>/dev/null || true; fi
   dmesg 2>/dev/null | grep -iE 'snd|hda|sof|ALC|CSC3551' | tail -5 >>"$LOG_FILE" 2>/dev/null || true
-  if [ "$VERBOSE" -eq 1 ]; then info "Play any audio to confirm sound works after reboot."; fi
+}
+test_sound() {
+  # Offers the test tone, asks if it was heard. Sets HEARD=Y/N/skip.
+  HEARD="skip"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "  (dry-run) would offer a test sound"
+    return 0
+  fi
+  if ! can_prompt; then return 0; fi
+  if ! confirm_yn "Play a test sound? [Y/n]:" "Y"; then
+    info "Test skipped. Play any audio yourself to confirm."
+    return 0
+  fi
+  info "Playing a test sound..."
+  log_plain "speaker-test start"
+  if command -v timeout &>/dev/null; then
+    timeout 8 speaker-test -c2 -t wav -D "hw:${CARD_NUM}" -l1 >>"$LOG_FILE" 2>&1
+  else
+    speaker-test -c2 -t wav -D "hw:${CARD_NUM}" -l1 >>"$LOG_FILE" 2>&1
+  fi
+  local code=$?
+  log_plain "speaker-test exit=$code"
+  if [ "$code" -ne 0 ]; then
+    warn "The test sound itself failed to play (see log). Check the output device first."
+  fi
+  if confirm_yn "Did you hear it? [y/N]:" "N"; then HEARD="Y"; else HEARD="N"; fi
+}
+test_failed_next_steps() {
+  warn "No sound heard. Things to try:"
+  log "  1. Check the output device:  wpctl status"
+  log "  2. Or open the volume panel:  pavucontrol"
+  log "  3. Re-run with details:       $0 --verbose"
+  log "  4. Share this log for help:   $LOG_FILE"
+  log_plain "next: wpctl status / pavucontrol / --verbose / log"
 }
 
 do_uninstall() {
-  step "Uninstalling AudioFix persistence"
+  step "Removing permanent fix"
   if [ "$DRY_RUN" -eq 1 ]; then log "  (dry-run) would remove /etc/modprobe.d/alsa-fix.conf + audiofix-hdaverb.service"; return 0; fi
   if [ -f /etc/modprobe.d/alsa-fix.conf ] && [ ! -L /etc/modprobe.d/alsa-fix.conf ]; then run $SUDO rm -f /etc/modprobe.d/alsa-fix.conf && ok "Removed /etc/modprobe.d/alsa-fix.conf"
   elif [ -L /etc/modprobe.d/alsa-fix.conf ]; then warn "Refusing to remove symlink /etc/modprobe.d/alsa-fix.conf"
@@ -1120,40 +1306,115 @@ do_uninstall() {
   else info "No audiofix-hdaverb.service found"; fi
   if [ -f /usr/local/bin/audiofix-verbs.sh ] && [ ! -L /usr/local/bin/audiofix-verbs.sh ]; then run $SUDO rm -f /usr/local/bin/audiofix-verbs.sh && ok "Removed helper"; fi
   if [ -n "$BACKUP_STATE_FILE" ] && [ -f "$BACKUP_STATE_FILE" ]; then
-    case "$BACKUP_STATE_FILE" in
-      /var/tmp/audiofix-backup-*|/tmp/audiofix-backup-*)
-        if $SUDO alsactl restore -f "$BACKUP_STATE_FILE" >>"$LOG_FILE" 2>&1; then ok "Restored $BACKUP_STATE_FILE"; fi ;;
-      *) warn "Refusing to restore from unexpected path: $BACKUP_STATE_FILE" ;;
-    esac
+    if backup_allowed_path "$BACKUP_STATE_FILE"; then
+      if $SUDO alsactl restore -f "$BACKUP_STATE_FILE" >>"$LOG_FILE" 2>&1; then ok "Restored $BACKUP_STATE_FILE"; fi
+    else warn "Refusing to restore from unexpected path: $BACKUP_STATE_FILE"; fi
   else
     local latest=""
-    latest=$(find /var/tmp /tmp -maxdepth 2 -name 'asound.state.*' -path '*audiofix-backup-*' -print 2>/dev/null | head -n1 || true)
+    latest=$(find_latest_backup)
     if [ -n "$latest" ]; then
-      case "$latest" in
-        /var/tmp/audiofix-backup-*|/tmp/audiofix-backup-*)
-          info "Found backup $latest"
-          if $SUDO alsactl restore -f "$latest" >>"$LOG_FILE" 2>&1; then ok "Restored $latest"; else warn "Restore failed"; fi ;;
-        *) warn "Refusing to restore from unexpected path" ;;
-      esac
+      if backup_allowed_path "$latest"; then
+        info "Found backup $latest"
+        if $SUDO alsactl restore -f "$latest" >>"$LOG_FILE" 2>&1; then ok "Restored $latest"; else warn "Restore failed"; fi
+      else warn "Refusing to restore from unexpected path"; fi
     else info "No ALSA backup found to restore"; fi
   fi
 }
 
+find_latest_backup() {
+  # Prints newest saved settings file under known backup folders, or nothing.
+  local roots=()
+  [ -d /var/lib/audiofix ] && roots+=(/var/lib/audiofix)
+  if [ -n "${HOME:-}" ] && [ -d "${HOME}/.local/state/audiofix" ]; then
+    roots+=("${HOME}/.local/state/audiofix")
+  fi
+  roots+=(/var/tmp /tmp)
+  find "${roots[@]}" -maxdepth 2 -name 'asound.state.*' -print 2>/dev/null | head -n1 || true
+}
+backup_allowed_path() {
+  # Returns 0 if $1 lives inside a known backup folder (canonicalized).
+  local _c
+  _c="$(canon_path "$1")"
+  case "$_c" in
+    /var/lib/audiofix/*|/var/tmp/audiofix-backup-*|/tmp/audiofix-backup-*) return 0 ;;
+  esac
+  if [ -n "${HOME:-}" ]; then
+    case "$_c" in "${HOME}"/.local/state/audiofix/*) return 0 ;; esac
+  fi
+  return 1
+}
+do_restore() {
+  section "Undo"
+  local src="${RESTORE_DIR:-}"
+  if [ -z "$src" ]; then
+    src="$(find_latest_backup)"
+  else
+    [ -d "$src" ] || die "Backup folder not found: $src. Check the path with --help." "$EXIT_USAGE"
+    src="$(find "$src" -maxdepth 1 -name 'asound.state.*' -print 2>/dev/null | head -n1 || true)"
+  fi
+  [ -n "$src" ] || die "No saved settings found to put back. Run a fix first to create a backup, or check --backup-dir." "$EXIT_ENV"
+  backup_allowed_path "$src" || die "Refusing to restore from an unexpected place. Backups live under /var/lib/audiofix or ~/.local/state/audiofix." "$EXIT_ENV"
+  [ -L "$src" ] && die "Refusing to restore through a symlink: $src" "$EXIT_ENV"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "Would put back: $src (nothing changed)"
+    return 0
+  fi
+  if $SUDO alsactl restore -f "$src" >>"$LOG_FILE" 2>&1; then
+    ok "Settings put back from backup."
+    JSON_STATUS="ok"
+  else
+    die "Restore failed. See the log: $LOG_FILE" "$EXIT_ENV"
+  fi
+}
+
+show_plan() {
+  if [ "$DRY_RUN" -eq 1 ]; then section "What would change"; else section "What will change"; fi
+  log "  ${M_BULLET} Unmute ${UNMUTED_PREVIEW:-Master, Speaker and PCM}, and set volume to 80%"
+  log "  ${M_BULLET} Turn off Auto-Mute (speakers stay on when headphones are plugged in)"
+  log "  ${M_BULLET} Send the $MODEL startup commands to the chip (${#GENERIC_VERBS[@]} commands)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "  A backup would be saved first. Nothing changes until you confirm."
+  else
+    log "  A backup is saved first. Nothing changes until you confirm."
+  fi
+  log_plain "Plan: unmute + Auto-Mute off + chip init (${#GENERIC_VERBS[@]} verbs)"
+}
+preview_unmute() {
+  # Names the mixer controls that actually exist, for the plan screen.
+  UNMUTED_PREVIEW=""
+  if ! command -v amixer &>/dev/null; then return 0; fi
+  local found=()
+  local ctl
+  for ctl in Master Headphone Speaker PCM Front; do
+    if amixer -c "$CARD_NUM" scontrols 2>/dev/null | grep -q "'$ctl'"; then
+      found+=("$ctl")
+    fi
+  done
+  if [ "${#found[@]}" -gt 0 ]; then UNMUTED_PREVIEW="${found[*]}"; fi
+}
 handle_reboot() {
-  log "  Log: $LOG_FILE"
-  if [ -n "${BACKUP_DIR:-}" ]; then log "  Backup: $BACKUP_DIR"; fi
-  log_plain "Log: $LOG_FILE"
-  if [ "$NO_REBOOT" -eq 1 ]; then info "Reboot skipped (--dry-run/--no-reboot). Reboot manually: sudo reboot"; return 0; fi
-  # Decided upfront in main (wizard Q3). Never asks here.
+  if [ "$NO_REBOOT" -eq 1 ]; then
+    if [ "$PERSIST" = "no" ]; then
+      warn "Do not restart: it would undo this temporary fix."
+    else
+      info "Restart on your own when ready: sudo reboot"
+    fi
+    return 0
+  fi
+  # Asked upfront in main (only when a restart is needed). Never asks here.
   if [ "$DO_REBOOT" -eq 1 ] || [ "${WANT_REBOOT:-N}" = "Y" ]; then
-    ok "Rebooting in 5s (Ctrl+C to cancel)..."
+    ok "Restarting in 5s (Ctrl+C to cancel)..."
     sleep 5
     cleanup
     if command -v systemctl &>/dev/null; then $SUDO systemctl reboot || $SUDO reboot
     else $SUDO reboot; fi
     return 0
   fi
-  info "Done. Reboot manually when convenient: sudo reboot"
+  if [ "$PERSIST" = "no" ]; then
+    warn "Do not restart: it would undo this temporary fix."
+  else
+    info "Restart on your own when ready: sudo reboot"
+  fi
   return 0
 }
 
@@ -1165,22 +1426,33 @@ main() {
   init_colors
   init_log
   trap cleanup EXIT
-  trap 'cleanup; trap - EXIT INT TERM HUP; err "AudioFix failed (see log)"; exit $EXIT_ENV' ERR
-  trap cleanup INT TERM HUP
+  trap 'JSON_DETAIL="Stopped while running: $BASH_COMMAND. Check the log for details."; cleanup; trap - EXIT INT TERM HUP; err "Stopped while running: $BASH_COMMAND. Check the log for details."; exit $EXIT_ENV' ERR
+  trap on_interrupt INT TERM HUP
+  if [ "$DRY_RUN" -eq 0 ] && [ "$LIST_CHIPS_ONLY" -eq 0 ]; then
+    acquire_lock
+  fi
 
-  echo ""
+  if [ "$QUIET" -eq 0 ]; then echo ""; fi
   banner
-  echo ""
+
+  if [ "$RESTORE" -eq 1 ]; then
+    init_sudo
+    do_restore
+    JSON_STATUS="ok"
+    exit "$?"
+  fi
 
   if [ "$UNINSTALL" -eq 1 ]; then
     init_sudo
     do_uninstall
+    JSON_STATUS="ok"
     handle_reboot
     exit "$EXIT_OK"
   fi
 
   if [ "$LIST_CHIPS_ONLY" -eq 1 ]; then
     list_chips
+    JSON_STATUS="ok"
     exit "$EXIT_OK"
   fi
 
@@ -1194,45 +1466,82 @@ main() {
   fi
 
   init_sudo
+  section "Checking your system"
   ensure_deps
   detect_chips || exit "$EXIT_NO_CHIP"
   choose_chip
+  info "System: $OS_PRETTY"
+  info "Sound server: $SOUND_SERVER"
+  log_plain "System: $OS_PRETTY / $SOUND_SERVER"
+  preview_unmute
 
-  if [ "$DRY_RUN" -eq 1 ]; then info "DRY-RUN: no changes will be made"; fi
+  if [ "$DRY_RUN" -eq 1 ]; then info "Preview only - nothing will change"; fi
 
-  log "Fix will: unmute, turn off Auto-Mute, run init."
-  log_plain "Plan: unmute + Auto-Mute off + hda-verb init"
+  show_plan
   if can_prompt; then
-    if [ "$PERSIST" = "prompt" ]; then
-      if confirm_yn "2/3 Keep fix after reboot? [Y/n]:" "Y"; then PERSIST="yes"; else PERSIST="no"; fi
+    if ! confirm_yn "Apply the fix now? [Y/n]:" "Y"; then
+      info "Stopped. Nothing was changed."
+      JSON_STATUS="aborted"
+      exit "$EXIT_ABORT"
     fi
-    if [ "$DO_REBOOT" -eq 0 ] && [ "$NO_REBOOT" -eq 0 ]; then
-      if confirm_yn "3/3 Reboot when done? [y/N]:" "N"; then WANT_REBOOT="Y"; else WANT_REBOOT="N"; fi
-    elif [ "$DO_REBOOT" -eq 1 ]; then
-      WANT_REBOOT="Y"
-    else
-      WANT_REBOOT="N"
+    if [ "$PERSIST" = "prompt" ]; then
+      if confirm_yn "Keep it after restart? (recommended) [Y/n]:" "Y"; then PERSIST="yes"; else PERSIST="no"; fi
     fi
   else
     if [ "$PERSIST" = "prompt" ]; then PERSIST="yes"; fi
-    if [ "$DO_REBOOT" -eq 1 ]; then WANT_REBOOT="Y"; else WANT_REBOOT="N"; fi
   fi
+  if [ "$DO_REBOOT" -eq 1 ]; then WANT_REBOOT="Y"; else WANT_REBOOT="N"; fi
 
-  log "Working..."
-  log_plain "Working..."
-
+  section "Applying"
   backup_alsa
+  info "Undo anytime with: $0 --restore"
+  log_plain "Undo: $0 --restore"
   fix_alsa
   fix_hda_verbs || exit "$?"
-  if [ "$PERSIST" != "no" ]; then persist_fix; else info "Persistence skipped (--no-persist)"; fi
+  if [ "$PERSIST" != "no" ]; then persist_fix; else warn "Temporary fix: a restart will undo it."; fi
   verify_fix
 
-  log "Done: unmuted, Auto-Mute ${AUTOMUTE_DONE}/${AUTOMUTE_TOTAL} off, init ${VERBS_OK}/${VERBS_TOTAL}. Reboot: $([ "$WANT_REBOOT" = "Y" ] && echo yes || echo no)."
-  log_plain "Done: model=$MODEL card=$CARD_NUM verbs=$VERBS_OK/$VERBS_TOTAL reboot=$WANT_REBOOT"
+  section "Testing"
+  test_sound
+
+  if [ "$HEARD" = "N" ]; then
+    JSON_STATUS="verify_failed"
+    test_failed_next_steps
+    log "  Log: $LOG_FILE"
+    log_plain "Log: $LOG_FILE"
+    exit "$EXIT_VERIFY"
+  fi
+
+  section "Done"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$PERSIST" = "no" ]; then JSON_STATUS="temporary"; else JSON_STATUS="ok"; fi
+    log "  Nothing was changed."
+    log "  Log:       $LOG_FILE"
+    log_plain "Dry run complete, nothing changed"
+    return 0
+  fi
+  if [ "$PERSIST" = "no" ]; then
+    JSON_STATUS="temporary"
+    warn "Done, but this fix is temporary and will be lost on restart."
+    log "  Run again without --no-persist to make it permanent."
+    log "  Undo it:   $0 --restore"
+    log "  Log:       $LOG_FILE"
+  else
+    JSON_STATUS="ok"
+    ok "Done. Your audio fix is active and will survive a restart."
+    log "  Undo it:   $0 --restore"
+    log "  Log:       $LOG_FILE"
+  fi
+  log_plain "Done: model=$MODEL card=$CARD_NUM verbs=$VERBS_OK/$VERBS_TOTAL persist=$PERSIST heard=$HEARD"
   if [ "$IFACE" != "HDA" ]; then warn "$MODEL is $IFACE - see USB/SOF guidance above."; fi
   if [ -n "$SOF_HINT" ]; then warn "SOF/amp hint - check sof-firmware + CS35L41 quirk."; fi
-  log "Log: $LOG_FILE"
-  log_plain "Log: $LOG_FILE"
+
+  # A restart is only needed to load the permanent settings.
+  if [ "$PERSIST" != "no" ] && [ "$NO_REBOOT" -eq 0 ] && [ "$DO_REBOOT" -eq 0 ]; then
+    if can_prompt; then
+      if confirm_yn "Restart now? [y/N]:" "N"; then WANT_REBOOT="Y"; fi
+    fi
+  fi
 
   handle_reboot
 }
