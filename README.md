@@ -1,148 +1,64 @@
-# Linux Audio Fix
+# AudioFix
 
-This repository provides a script to help you fix issues with Realtek audio drivers in Linux. There are two methods to resolve the issue: an automated method and a manual method.
+Fix audio issue in Linux based operating systems.
 
-## 1. Automated Method
+![Stars](https://img.shields.io/github/stars/hello2himel/linux-audio-fix?style=flat-square)
+![Forks](https://img.shields.io/github/forks/hello2himel/linux-audio-fix?style=flat-square)
+![Issues](https://img.shields.io/github/issues/hello2himel/linux-audio-fix?style=flat-square)
+![Last commit](https://img.shields.io/github/last-commit/hello2himel/linux-audio-fix?style=flat-square)
+![Bash](https://img.shields.io/badge/shell-bash-green?style=flat-square&logo=gnu-bash)
+![Linux](https://img.shields.io/badge/platform-linux-blue?style=flat-square&logo=linux)
+![Visitors](https://komarev.com/ghpvc/?username=hello2himel&repo=linux-audio-fix&color=blue&style=flat-square)
 
-The automated method allows you to fix the issue by simply running a script. Follow these steps:
+> Visitor counter via `komarev.com/ghpvc`. Alternative: `https://visitor-badge.laobi.icu/badge?page_id=hello2himel.linux-audio-fix`
 
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/hello2himel/linux-audio-fix/main/AudioFix.sh | bash
-   ```
+Realtek HDA fix: disables Auto-Mute, unmutes essentials, runs EAPD/coef `hda-verb` init, installs boot persistence (modprobe + systemd replay).
 
-The script will automatically install the necessary tools, detect the Realtek chip, disable auto-mute, run `hda-verb` commands, and reboot your system.
+## Quick run
 
----
+```bash
+curl -fsSL https://raw.githubusercontent.com/hello2himel/linux-audio-fix/main/AudioFix.sh | bash
+```
 
-## 2. Manual Method
+```bash
+./AudioFix.sh --list-chips
+./AudioFix.sh --dry-run --verbose
+./AudioFix.sh
+./AudioFix.sh --yes --reboot
+./AudioFix.sh --card 1 --chip ALC256 --force
+./AudioFix.sh --uninstall
+```
 
-If the automated method does not resolve your issue, you can follow the manual process below to fix your Realtek audio drivers.
+No prompts hidden: questions print to `/dev/tty` then read from `/dev/tty`. `--yes` / non-TTY / `--dry-run` uses defaults, never blocks.
 
-### Step-by-Step:
+## What it does
 
-1. **Update Your Motherboard BIOS:**
-   Ensure that your motherboard BIOS is updated to the latest version. Check your motherboard manufacturer's website for the latest BIOS update instructions.
+1. `[1/6]` Deps: `alsa-utils`, `alsa-tools`, `pciutils/usbutils` (arch/debian/fedora/suse/gentoo/alpine/void, NixOS aborts with instructions).
+2. `[2/6]` Detect: `/proc/asound/card*/codec#*` (`0x10ec`), fallback `aplay -l`, USB/SOF hints. 70+ HDA chips allowlisted, USB `ALC4080/4082/4040/4050` and SOF `RT5682/715/714/1318` safely skipped with UCM/SOF guidance.
+3. `[3/6]` Backup to `/var/tmp/audiofix-backup-*`.
+4. `[4/6]` Disable all Auto-Mute controls (`Disabled`/`Off` + verify), unmute Master/Headphone/Speaker/PCM 80%, `alsactl store`.
+5. `[5/6]` `hda-verb` GET probe + 4 generic verbs on verified `/dev/snd/hwCxDy`. Unknown codecs require `--force`.
+6. `[6/6]` Persistence: `/etc/modprobe.d/alsa-fix.conf` + `audiofix-hdaverb.service` replay. `--no-persist` to skip.
 
-2. **Install alsa-utils (if not already installed):**
-   Open your terminal and type the following command to install `alsa-utils`. For Arch-based systems, use:
-   ```bash
-   sudo pacman -S alsa-utils
-   ```
+Exit codes: `0 ok | 1 env | 2 no chip | 3 pkg fail | 4 verb fail`. Log: `/tmp/audiofix-*.log` (`--log-file PATH`).
 
-   For other distributions like Ubuntu/Fedora, `alsa-utils` might already be installed.
+## Manual method
 
-3. **Launch alsamixer:**
-   In your terminal, type `alsamixer` and press Enter. If the terminal doesn't detect the command, ensure that `alsa-utils` is installed.
+If auto fails, see original steps: BIOS update, `alsamixer` (F6 select card, Auto-Mute Disabled), `alsa-tools`, then:
 
-4. **Select the Realtek Sound Card:**
-   - After launching `alsamixer` in your terminal, press `F6` to open the **"Select Sound Card"** menu.
-   - You will see a list of available sound cards. The names may appear generic, such as **"HD-Audio Generic"** or similar, depending on your system's configuration.
-   - Use the **arrow keys** to navigate through the list of sound cards. Once you highlight a card, press **Enter** to select it.
-   - After selecting a card, if it's a Realtek chip, you'll see its details in the new menu (such as **ALC897**, **ALC1220**, etc.). This confirms that you have selected the correct Realtek sound card.
+```bash
+sudo hda-verb /dev/snd/hwC0D0 0x20 0x500 0x1b
+sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x4a4b
+sudo hda-verb /dev/snd/hwC0D0 0x20 0x500 0xf
+sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x74
+sudo reboot
+```
 
-   If the selected card is not a Realtek chip, you may need to check the system's audio hardware to ensure the correct card is selected.
-
-   **Here’s a tutorial showing how to disable Auto-Mute:**
-
-   ![Disable Auto-Mute](res/disableAutomute.gif)
-
-5. **Disable Auto-Mute:**
-   Using the arrow keys, navigate to the **Auto-Mute** option on the right side and disable it by pressing the `UP/DOWN` arrow keys. Press `ESC` to exit `alsamixer`.
-
-6. **Install hda-verb (if not already installed):**
-   You need to install `hda-verb` to run specific commands. Install it using the following commands:
-
-   For **Debian/Ubuntu/Raspbian/Kali Linux**:
-   ```bash
-   sudo apt-get install alsa-tools
-   ```
-
-   For **Arch Linux**:
-   ```bash
-   sudo pacman -S alsa-tools
-   ```
-
-   For **Fedora**:
-   ```bash
-   sudo dnf install alsa-tools
-   ```
-
-7. **Run the following `hda-verb` commands:**
-   These commands modify audio configurations:
-   ```bash
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x500 0x1b
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x4a4b
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x500 0xf
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x74
-   ```
-
-8. **Reboot Your System:**
-   After executing the commands, reboot your system to apply the changes:
-   ```bash
-   sudo reboot
-   ```
-
----
-
-## Tools Used
-
-### 1. **Git**
-   Git is used to clone the repository onto your system. This allows you to download the necessary scripts and files directly from the source repository.
-
-   **Command:**
-   ```bash
-   git clone https://github.com/hello2himel/linux-audio-fix.git
-   ```
-
-### 2. **chmod**
-   The `chmod` command is used to change the permissions of the `AudioFix.sh` script, allowing it to be executed.
-
-   **Command:**
-   ```bash
-   chmod +x AudioFix.sh
-   ```
-
-### 3. **alsamixer**
-   `alsamixer` is a terminal-based utility to control the volume and settings of your sound card on Linux. We use it to disable the auto-mute function, which is known to cause audio issues with some Realtek sound chips.
-
-   **Command:**
-   ```bash
-   alsamixer
-   ```
-
-### 4. **hda-verb**
-   `hda-verb` is a tool used to send specific commands to the audio hardware via the `hda` driver. It helps in fine-tuning the audio driver settings, which can help resolve issues like no sound or mic problems.
-
-   **Commands:**
-   ```bash
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x500 0x1b
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x4a4b
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x500 0xf
-   sudo hda-verb /dev/snd/hwC0D0 0x20 0x477 0x74
-   ```
-
----
+![Disable Auto-Mute](res/disableAutomute.gif)
 
 ## FAQ
 
-### 1. **Why should I update my motherboard BIOS?**
-   Updating your motherboard BIOS can fix compatibility issues with various hardware, including sound cards. A new BIOS version may have improvements or fixes related to your Realtek sound card.
-
-### 2. **What if `alsamixer` does not detect my sound card?**
-   If `alsamixer` doesn't detect your sound card, ensure that `alsa-utils` is properly installed. You can try reinstalling it.
-### 3. **What if the automated script does not work?**
-   If the automated script does not fix the issue, try following the manual method. The manual method involves more direct control over your system's audio settings, including disabling auto-mute and running `hda-verb` commands.
-
-### 4. **Do I need to run `hda-verb` commands every time I reboot?**
-   No, after successfully running the `hda-verb` commands and rebooting your system, the changes should persist. You shouldn't need to run them again unless there's a system update or other issue that causes the settings to reset.
-
-### 5. **Can I use this fix on any Linux distribution?**
-   Yes, this fix should work on most Linux distributions that use the ALSA sound system, such as Ubuntu, Fedora, and Arch Linux. You may need to adjust some commands depending on your distro's package manager.
-
----
-
-## Conclusion
-
-If the automated method doesn't work for you, follow the manual steps to resolve the issue. By disabling auto-mute and running `hda-verb` commands, you should be able to fix the Realtek audio driver issue on Linux.
-
----
+- USB `ALC4080/82`? `hda-verb` does not apply. Check UCM `USB-Audio.conf` VID:PID + PipeWire profile.
+- SOF / `CSC3551` / smart-amp? Needs `sof-firmware` + amp quirk, not just verbs.
+- Test tone? Answered prompt runs `speaker-test -c2 -D hw:N -l1`, or run manually.
+- Revert? `--uninstall` removes conf/unit and restores ALSA backup.
