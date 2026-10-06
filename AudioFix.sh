@@ -1258,41 +1258,6 @@ verify_fix() {
   if command -v aplay &>/dev/null; then LC_ALL=C aplay -l 2>/dev/null | head -10 >>"$LOG_FILE" 2>/dev/null || true; fi
   dmesg 2>/dev/null | grep -iE 'snd|hda|sof|ALC|CSC3551' | tail -5 >>"$LOG_FILE" 2>/dev/null || true
 }
-test_sound() {
-  # Offers the test tone, asks if it was heard. Sets HEARD=Y/N/skip.
-  HEARD="skip"
-  if [ "$DRY_RUN" -eq 1 ]; then
-    log "  (dry-run) would offer a test sound"
-    return 0
-  fi
-  if ! can_prompt; then return 0; fi
-  if ! confirm_yn "Play a test sound? [Y/n]:" "Y"; then
-    info "Test skipped. Play any audio yourself to confirm."
-    return 0
-  fi
-  info "Playing a test sound..."
-  log_plain "speaker-test start"
-  if command -v timeout &>/dev/null; then
-    timeout 8 speaker-test -c2 -t wav -D "hw:${CARD_NUM}" -l1 >>"$LOG_FILE" 2>&1
-  else
-    speaker-test -c2 -t wav -D "hw:${CARD_NUM}" -l1 >>"$LOG_FILE" 2>&1
-  fi
-  local code=$?
-  log_plain "speaker-test exit=$code"
-  if [ "$code" -ne 0 ]; then
-    warn "The test sound itself failed to play (see log). Check the output device first."
-  fi
-  if confirm_yn "Did you hear it? [y/N]:" "N"; then HEARD="Y"; else HEARD="N"; fi
-}
-test_failed_next_steps() {
-  warn "No sound heard. Things to try:"
-  log "  1. Check the output device:  wpctl status"
-  log "  2. Or open the volume panel:  pavucontrol"
-  log "  3. Re-run with details:       $0 --verbose"
-  log "  4. Share this log for help:   $LOG_FILE"
-  log_plain "next: wpctl status / pavucontrol / --verbose / log"
-}
-
 do_uninstall() {
   step "Removing permanent fix"
   if [ "$DRY_RUN" -eq 1 ]; then log "  (dry-run) would remove /etc/modprobe.d/alsa-fix.conf + audiofix-hdaverb.service"; return 0; fi
@@ -1504,17 +1469,6 @@ main() {
   if [ "$PERSIST" != "no" ]; then persist_fix; else warn "Temporary fix: a restart will undo it."; fi
   verify_fix
 
-  section "Testing"
-  test_sound
-
-  if [ "$HEARD" = "N" ]; then
-    JSON_STATUS="verify_failed"
-    test_failed_next_steps
-    log "  Log: $LOG_FILE"
-    log_plain "Log: $LOG_FILE"
-    exit "$EXIT_VERIFY"
-  fi
-
   section "Done"
   if [ "$DRY_RUN" -eq 1 ]; then
     if [ "$PERSIST" = "no" ]; then JSON_STATUS="temporary"; else JSON_STATUS="ok"; fi
@@ -1535,7 +1489,7 @@ main() {
     log "  Undo it:   $0 --restore"
     log "  Log:       $LOG_FILE"
   fi
-  log_plain "Done: model=$MODEL card=$CARD_NUM verbs=$VERBS_OK/$VERBS_TOTAL persist=$PERSIST heard=$HEARD"
+  log_plain "Done: model=$MODEL card=$CARD_NUM verbs=$VERBS_OK/$VERBS_TOTAL persist=$PERSIST"
   if [ "$IFACE" != "HDA" ]; then warn "$MODEL is $IFACE - see USB/SOF guidance above."; fi
   if [ -n "$SOF_HINT" ]; then warn "SOF/amp hint - check sof-firmware + CS35L41 quirk."; fi
 
