@@ -351,21 +351,24 @@ ask() {
   # Prints visibly via /dev/tty. Echoes the default when Enter is empty
   # (typed input is already echoed by the terminal - never print it twice).
   local question="$1" def="$2" __var="$3"
-  local ans="" typed_empty=0
+# NOTE: internal buffer is _ans on purpose: with bash dynamic scope,
+# printf -v "$__var" would otherwise write our own local instead of
+# the caller variable, and every answer would be lost.
+  local _ans="" typed_empty=0
   printf '%b?%b %s ' "$C_ACCENT" "$C_RESET" "$question" > /dev/tty 2>/dev/null \
     || printf '? %s ' "$question"
   log_plain "ASK: $question (default=${def})"
-  if ! IFS= read -r -t 60 ans </dev/tty; then ans=""; fi
-  if [ -z "$ans" ]; then
+  if ! IFS= read -r -t 60 _ans </dev/tty; then _ans=""; fi
+  if [ -z "$_ans" ]; then
     typed_empty=1
     printf '%s\n' "$def" > /dev/tty 2>/dev/null || true
   fi
-  ans="${ans:-$def}"
-  printf -v "$__var" '%s' "$ans"
+  _ans="${_ans:-$def}"
+  printf -v "$__var" '%s' "$_ans"
   if [ "$typed_empty" -eq 1 ]; then
-    log "  Chose: $ans (default)"
+    log "  Chose: $_ans (default)"
   fi
-  log_plain "CHOSE: $ans"
+  log_plain "CHOSE: $_ans"
 }
 # --- Plain prompts only (no external TUI deps by design) ---
 # gum/fzf/dialog intentionally not used: keep curl|bash predictable.
